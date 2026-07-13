@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="hu">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Offline autós és gyalogos forgalomszimuláció Budapest XI. kerületének OpenStreetMap úthálózatán."
+    />
+    <title>Újbuda offline forgalomszimulátor</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="sidebar">
+        <header class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <div>
+            <p class="eyebrow">Budapest XI. kerület</p>
+            <h1>Városi áramlás</h1>
+          </div>
+        </header>
+
+        <section id="dataset-panel" class="panel setup-panel" aria-labelledby="dataset-title">
+          <div class="panel-heading">
+            <span class="step-number">01</span>
+            <div>
+              <h2 id="dataset-title">Helyi úthálózat</h2>
+              <p id="network-status">A fix OSM-adatkészlet betöltése…</p>
+            </div>
+          </div>
+          <div class="dataset-summary">
+            <span class="dataset-dot" aria-hidden="true"></span>
+            <span id="network-details">Nincs külső térképes API-forgalom.</span>
+          </div>
+          <button id="reload-network" class="secondary-button dataset-button" type="button">
+            Térkép újratöltése
+          </button>
+        </section>
+
+        <section class="panel controls-panel" aria-labelledby="controls-title">
+          <div class="panel-heading compact">
+            <span class="step-number">02</span>
+            <div>
+              <h2 id="controls-title">Szimuláció</h2>
+              <p id="route-status">A helyi Python motorra vár.</p>
+            </div>
+          </div>
+
+          <div class="control-group">
+            <div class="control-label-row">
+              <label for="car-count">Autók</label>
+              <output id="car-count-value" for="car-count">400</output>
+            </div>
+            <input id="car-count" type="range" min="0" max="2000" step="50" value="400" disabled />
+            <div class="range-scale"><span>0</span><span>2000</span></div>
+          </div>
+
+          <div class="control-group">
+            <div class="control-label-row">
+              <label for="pedestrian-count">Gyalogosok</label>
+              <output id="pedestrian-count-value" for="pedestrian-count">600</output>
+            </div>
+            <input
+              id="pedestrian-count"
+              type="range"
+              min="0"
+              max="3000"
+              step="50"
+              value="600"
+              disabled
+            />
+            <div class="range-scale"><span>0</span><span>3000</span></div>
+          </div>
+
+          <div class="control-group select-group">
+            <label for="simulation-speed">Időgyorsítás</label>
+            <select id="simulation-speed" disabled>
+              <option value="1">1× — valós idő</option>
+              <option value="5">5×</option>
+              <option value="15" selected>15×</option>
+              <option value="30">30×</option>
+              <option value="60">60×</option>
+            </select>
+          </div>
+
+          <fieldset class="agent-color-controls">
+            <legend>Ágensszínek</legend>
+            <label class="agent-color-toggle" for="car-individual-colors">
+              <span><i class="agent-color-swatch car-swatch" aria-hidden="true"></i>Autók egyedi színei</span>
+              <input id="car-individual-colors" type="checkbox" role="switch" />
+            </label>
+            <label class="agent-color-toggle" for="pedestrian-individual-colors">
+              <span><i class="agent-color-swatch pedestrian-swatch" aria-hidden="true"></i>Gyalogosok egyedi színei</span>
+              <input id="pedestrian-individual-colors" type="checkbox" role="switch" />
+            </label>
+            <p>Kikapcsolva minden autó narancs, minden gyalogos kék.</p>
+          </fieldset>
+
+          <div class="button-row">
+            <button id="start-pause" class="primary-button" type="button" disabled>
+              <span class="button-icon" aria-hidden="true">▶</span>
+              <span class="button-label">Indítás</span>
+            </button>
+            <button id="reset" class="secondary-button" type="button" disabled>Alaphelyzet</button>
+          </div>
+
+          <div class="replay-control" aria-labelledby="replay-label">
+            <div class="replay-heading">
+              <label id="replay-label" for="replay-range">Visszajátszás</label>
+              <output id="replay-position" for="replay-range" aria-live="polite">
+                Az előzmény gyűjtése induláskor kezdődik.
+              </output>
+            </div>
+            <input
+              id="replay-range"
+              type="range"
+              min="0"
+              max="0"
+              step="1"
+              value="0"
+              aria-label="Korábbi szimulációs állapot"
+              disabled
+            />
+            <div class="replay-actions">
+              <button id="replay-play" class="secondary-button" type="button" disabled>
+                <span class="button-icon" aria-hidden="true">▶</span>
+                <span class="button-label">Lejátszás</span>
+              </button>
+              <button id="replay-live" class="secondary-button" type="button" disabled>
+                Élő állapot
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel poi-panel" aria-labelledby="poi-title">
+          <div class="panel-heading compact poi-heading">
+            <span class="step-number">03</span>
+            <div>
+              <h2 id="poi-title">Helyszínek és megállók</h2>
+              <p id="poi-filter-summary">A helyszínadatok betöltése…</p>
+            </div>
+          </div>
+          <div class="poi-filter-actions" aria-label="Helyszínkategóriák gyors kijelölése">
+            <button id="poi-filter-all" type="button" disabled>Mind</button>
+            <button id="poi-filter-none" type="button" disabled>Egyik sem</button>
+          </div>
+          <div id="poi-filters" class="poi-filters" role="group" aria-label="Látható helyszínkategóriák"></div>
+          <p class="poi-snap-note">
+            A pont a helyszín valódi OSM-koordinátája; az A–B út a legközelebbi,
+            közlekedési módnak megfelelő úton kezdődik és végződik.
+          </p>
+        </section>
+
+        <section class="stats-grid" aria-label="Élő szimulációs adatok">
+          <article class="stat-card car-stat">
+            <span class="stat-kicker"><i></i> Autók átlagsebessége</span>
+            <strong><span id="car-speed">0,0</span> <small>km/h</small></strong>
+          </article>
+          <article class="stat-card pedestrian-stat">
+            <span class="stat-kicker"><i></i> Gyalogosok átlagsebessége</span>
+            <strong><span id="pedestrian-speed">0,0</span> <small>km/h</small></strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-kicker">Torlódási szint</span>
+            <strong><span id="congestion">0</span><small>%</small></strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-kicker">Befejezett utak</span>
+            <strong id="completed-trips">0</strong>
+          </article>
+        </section>
+      </aside>
+
+      <section class="map-stage" aria-label="Offline XI. kerületi forgalomszimuláció">
+        <div id="map" role="application" aria-label="Budapest XI. kerület helyi úthálózata"></div>
+        <div id="map-placeholder" class="map-placeholder">
+          <div class="placeholder-grid" aria-hidden="true"></div>
+          <div class="placeholder-content">
+            <span class="map-pin" aria-hidden="true"></span>
+            <p>Újbuda helyi térképe</p>
+            <span>Az egyszer letöltött OSM úthálózat betöltése folyamatban.</span>
+          </div>
+        </div>
+
+        <div class="map-topbar">
+          <div class="location-chip">
+            <span class="pulse-dot" aria-hidden="true"></span>
+            <span>XI. kerület · offline hálózat</span>
+          </div>
+          <div id="clock-chip" class="clock-chip">00:00:00</div>
+        </div>
+
+        <div id="map-inspector" class="map-inspector" hidden>
+          <button id="close-inspector" type="button" aria-label="Térképi adatok bezárása">×</button>
+          <strong id="inspector-name">Térképi elem</strong>
+          <span id="inspector-details"></span>
+        </div>
+
+        <div class="legend" aria-label="Jelmagyarázat">
+          <span><i id="legend-car-marker" class="legend-car"></i> Autó</span>
+          <span><i id="legend-pedestrian-marker" class="legend-pedestrian"></i> Gyalogos</span>
+          <span><i class="legend-road-car"></i> Autós út</span>
+          <span><i class="legend-road-pedestrian"></i> Csak gyalogos</span>
+          <span><i class="legend-road-mixed"></i> Vegyes út</span>
+          <span><i class="legend-poi"></i> Helyszín</span>
+        </div>
+
+        <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+        <a
+          class="walking-warning attribution"
+          href="https://www.openstreetmap.org/copyright"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          © OpenStreetMap contributors · ODbL
+        </a>
+      </section>
+    </main>
+
+    <script type="module" src="./src/app.js"></script>
+  </body>
+</html>
