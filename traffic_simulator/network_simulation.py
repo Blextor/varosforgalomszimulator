@@ -15,6 +15,8 @@ from .simulation import haversine_distance
 VALID_MODES = frozenset({"car", "pedestrian"})
 CAR_LENGTH_METERS = 7.5
 MIN_CAR_CRAWL_FACTOR = 0.1
+MIN_CAR_DENSITY_WINDOW_METERS = 40.0
+SEGMENT_STAT_WINDOW_SECONDS = 60.0
 LANE_WIDTH_METERS = 3.2
 SPATIAL_CELL_DEGREES = 0.003
 ROUTE_GRID_SIZE = 20
@@ -1113,6 +1115,10 @@ class NetworkAgent:
     origin_poi_kind: str = "poi"
     destination_poi_kind: str = "poi"
     relocation_generation: int = 0
+    free_flow_speed_ratio: float | None = None
+    car_headway_path_cache: tuple[Any, ...] | None = None
+    car_merge_path_cache: tuple[Any, ...] | None = None
+    car_density_window_cache: tuple[Any, ...] | None = None
 
 
 class NetworkTrafficSimulation:
@@ -1133,6 +1139,11 @@ class NetworkTrafficSimulation:
         self.agents: list[NetworkAgent] = []
         self.elapsed_seconds = 0.0
         self.completed_trips = 0
+        self.segment_passed_cars: Counter[str] = Counter()
+        self._segment_metric_buckets: deque[
+            tuple[float, dict[str, tuple[float, float, float]]]
+        ] = deque()
+        self._segment_metric_totals: dict[str, list[float]] = {}
         self.next_agent_id = 1
         self.route_cache: dict[
             tuple[str, str, str], tuple[str, ...] | None
@@ -1151,6 +1162,18 @@ class NetworkTrafficSimulation:
         self.route_selection_stats: dict[str, dict[str, Any]] = {}
         self.route_catalog_loaded = False
         self._network_bounds_cache: tuple[float, float, float, float] | None = None
+        self._lane_transition_cache: dict[
+            tuple[str, int, str, tuple[int, ...]], int
+        ] = {}
+        self._turn_lane_options_cache: dict[
+            tuple[str, str], tuple[int, ...]
+        ] = {}
+        self._merge_candidate_edge_ids = (
+            self._build_merge_candidate_edge_ids()
+        )
+        self._active_merge_approaches: dict[
+            tuple[str, int], int
+        ] | None = None
         if route_catalog is not None:
             self.route_catalog_loaded = self._load_route_catalog(route_catalog)
         if not self.route_catalog_loaded:
@@ -1164,6 +1187,9 @@ class NetworkTrafficSimulation:
         self.agents.clear()
         self.elapsed_seconds = 0.0
         self.completed_trips = 0
+        self.segment_passed_cars.clear()
+        self._segment_metric_buckets.clear()
+        self._segment_metric_totals.clear()
         self.gateway_exits = 0
         self.gateway_entries = 0
         self.route_reseeds = 0
@@ -2668,13 +2694,29 @@ class NetworkTrafficSimulation:
             self.agents = [agent for agent in self.agents if agent.id not in remove_ids]
             return
         car_edge_counts: Counter[str] = Counter()
-        car_lane_positions: dict[tuple[str, int], list[float]] = {}
+        car_lane_positions: dict[tuple[str, int], dict[int, float]] = {}
+        car_headway_reservations: dict[tuple[str, int], float] = {}
+        car_merge_positions: dict[tuple[str, int], list[float]] = {}
         if mode == "car":
             for agent in existing:
                 car_edge_counts[agent.edge.id] += 1
                 car_lane_positions.setdefault(
-                    (agent.edge.id, agent.lane_index), []
-                ).append(agent.distance_meters)
+                    (agent.edge.id, agent.lane_index), {}
+                )[agent.id] = agent.distance_meters
+                for edge_id, lane_index, reserved_distance in (
+                    self._initial_headway_reservations(agent)
+                ):
+                    key = (edge_id, lane_index)
+                    car_headway_reservations[key] = max(
+                        car_headway_reservations.get(key, 0.0),
+                        reserved_distance,
+                    )
+                for merge_key, merge_coordinate, _ in (
+                    self._merge_approach_slots(agent, CAR_LENGTH_METERS)
+                ):
+                    car_merge_positions.setdefault(merge_key, []).append(
+                        merge_coordinate
+                    )
         for _ in range(len(existing), target):
             candidate: NetworkAgent | None = None
             attempts = 96 if mode == "car" else 1
@@ -2689,14 +2731,72 @@ class NetworkTrafficSimulation:
                 ):
                     continue
                 positions = car_lane_positions.get(
-                    (created_candidate.edge.id, created_candidate.lane_index), ()
+                    (created_candidate.edge.id, created_candidate.lane_index), {}
                 )
                 if any(
                     abs(created_candidate.distance_meters - position)
                     < CAR_LENGTH_METERS
-                    for position in positions
+                    for position in positions.values()
                 ):
                     continue
+                if (
+                    created_candidate.distance_meters
+                    < car_headway_reservations.get(
+                        (
+                            created_candidate.edge.id,
+                            created_candidate.lane_index,
+                        ),
+                        0.0,
+                    )
+                    - 1e-9
+                ):
+                    continue
+                merge_slots = self._merge_approach_slots(
+                    created_candidate, CAR_LENGTH_METERS
+                )
+                if any(
+                    any(
+                        abs(merge_coordinate - existing_coordinate)
+                        < CAR_LENGTH_METERS
+                        for existing_coordinate in car_merge_positions.get(
+                            merge_key, ()
+                        )
+                    )
+                    for merge_key, merge_coordinate, _ in merge_slots
+                ):
+                    continue
+                next_edge = self.network.edges_by_id.get(
+                    created_candidate.planned_edge_id or ""
+                )
+                if (
+                    next_edge is not None
+                    and created_candidate.edge.length_meters
+                    - created_candidate.distance_meters
+                    < CAR_LENGTH_METERS
+                ):
+                    lane_options = self._lane_options_after_entry(
+                        created_candidate, next_edge
+                    )
+                    next_lane = self._mapped_lane_for_transition(
+                        created_candidate.edge,
+                        created_candidate.lane_index,
+                        next_edge,
+                        lane_options,
+                    )
+                    rear_distance = self._downstream_rear_distance(
+                        created_candidate,
+                        next_edge,
+                        next_lane,
+                        car_lane_positions,
+                    )
+                    if (
+                        rear_distance is not None
+                        and created_candidate.edge.length_meters
+                        - created_candidate.distance_meters
+                        + rear_distance
+                        < CAR_LENGTH_METERS - 1e-9
+                    ):
+                        continue
                 candidate = created_candidate
                 break
             if candidate is None:
@@ -2705,8 +2805,22 @@ class NetworkTrafficSimulation:
             if mode == "car":
                 car_edge_counts[candidate.edge.id] += 1
                 car_lane_positions.setdefault(
-                    (candidate.edge.id, candidate.lane_index), []
-                ).append(candidate.distance_meters)
+                    (candidate.edge.id, candidate.lane_index), {}
+                )[candidate.id] = candidate.distance_meters
+                for edge_id, lane_index, reserved_distance in (
+                    self._initial_headway_reservations(candidate)
+                ):
+                    key = (edge_id, lane_index)
+                    car_headway_reservations[key] = max(
+                        car_headway_reservations.get(key, 0.0),
+                        reserved_distance,
+                    )
+                for merge_key, merge_coordinate, _ in (
+                    self._merge_approach_slots(candidate, CAR_LENGTH_METERS)
+                ):
+                    car_merge_positions.setdefault(merge_key, []).append(
+                        merge_coordinate
+                    )
 
     def _edge_weight(self, edge: NetworkEdge, mode: str) -> float:
         if mode == "pedestrian":
@@ -2765,12 +2879,19 @@ class NetworkTrafficSimulation:
             origin_poi_kind = "gateway" if origin.gateway else "poi"
             destination_poi_kind = "gateway" if destination.gateway else "poi"
             way_history = self._route_history(route_edge_ids, route_index)
+        free_flow_speed_ratio = (
+            0.82 + self.random.random() * 0.18
+            if mode == "car"
+            else None
+        )
         agent = NetworkAgent(
             id=self.next_agent_id,
             mode=mode,
             edge=edge,
             distance_meters=distance_meters,
-            desired_speed_mps=self._desired_speed(edge, mode),
+            desired_speed_mps=self._desired_speed(
+                edge, mode, free_flow_speed_ratio
+            ),
             current_speed_mps=0.0,
             lane_index=self.random.randrange(edge.lanes),
             planned_edge_id=None,
@@ -2784,6 +2905,7 @@ class NetworkTrafficSimulation:
             destination_snap_distance_meters=destination_snap_distance_meters,
             origin_poi_kind=origin_poi_kind,
             destination_poi_kind=destination_poi_kind,
+            free_flow_speed_ratio=free_flow_speed_ratio,
         )
         self.next_agent_id += 1
         self._plan_next(agent)
@@ -2903,11 +3025,33 @@ class NetworkTrafficSimulation:
                 return origin, destination, route_edge_ids
         return None
 
-    def _desired_speed(self, edge: NetworkEdge, mode: str) -> float:
+    def _desired_speed(
+        self,
+        edge: NetworkEdge,
+        mode: str,
+        free_flow_speed_ratio: float | None = None,
+    ) -> float:
         if mode == "pedestrian":
             return 1.1 + self.random.random() * 0.55
         speed = edge.max_speed_kph / 3.6
-        return _clamp(speed * (0.82 + self.random.random() * 0.18), 2.5, 36.0)
+        ratio = (
+            free_flow_speed_ratio
+            if free_flow_speed_ratio is not None
+            else 0.82 + self.random.random() * 0.18
+        )
+        return _clamp(speed * ratio, 2.5, 36.0)
+
+    def _desired_speed_for_agent(
+        self, agent: NetworkAgent, edge: NetworkEdge
+    ) -> float:
+        if agent.mode != "car":
+            return self._desired_speed(edge, agent.mode)
+        ratio = agent.free_flow_speed_ratio
+        if ratio is None:
+            current_limit = max(1e-9, agent.edge.max_speed_kph / 3.6)
+            ratio = _clamp(agent.desired_speed_mps / current_limit, 0.5, 1.2)
+            agent.free_flow_speed_ratio = ratio
+        return self._desired_speed(edge, agent.mode, ratio)
 
     def _trip_target(self, mode: str) -> float:
         return (
@@ -2960,7 +3104,7 @@ class NetworkTrafficSimulation:
             }
             if candidate.id in allowed_ids:
                 agent.planned_edge_id = candidate.id
-                lane_options = self.network.lane_options_for_turn(
+                lane_options = self._turn_lane_options(
                     agent.edge, candidate
                 )
                 agent.lane_index = self._nearest_lane(
@@ -2982,8 +3126,18 @@ class NetworkTrafficSimulation:
             else self.random.choice(candidates)
         )
         agent.planned_edge_id = candidate.id
-        lane_options = self.network.lane_options_for_turn(agent.edge, candidate)
+        lane_options = self._turn_lane_options(agent.edge, candidate)
         agent.lane_index = self._nearest_lane(agent.lane_index, lane_options)
+
+    def _turn_lane_options(
+        self, edge: NetworkEdge, outgoing: NetworkEdge
+    ) -> tuple[int, ...]:
+        cache_key = (edge.id, outgoing.id)
+        cached_options = self._turn_lane_options_cache.get(cache_key)
+        if cached_options is None:
+            cached_options = self.network.lane_options_for_turn(edge, outgoing)
+            self._turn_lane_options_cache[cache_key] = cached_options
+        return cached_options
 
     @staticmethod
     def _clear_route(agent: NetworkAgent) -> None:
@@ -3036,10 +3190,423 @@ class NetworkTrafficSimulation:
             following_edge = self.network.edges_by_id[
                 agent.route_edge_ids[route_index + 1]
             ]
-            return self.network.lane_options_for_turn(
+            return self._turn_lane_options(
                 next_edge, following_edge
             )
         return tuple(range(next_edge.lanes))
+
+    def _mapped_lane_for_transition(
+        self,
+        source_edge: NetworkEdge,
+        source_lane: int,
+        target_edge: NetworkEdge,
+        target_lane_options: tuple[int, ...],
+    ) -> int:
+        """Map compatible source lanes onto compatible target lanes by rank.
+
+        Lane indices are local to an OSM edge.  Clamping a three-lane source
+        index to a two-lane target collapsed both source lanes 1 and 2 onto
+        target lane 1.  That is particularly visible where Bocskai ut feeds
+        the two-lane Nagyszolos utca.  Relative rank preserves both parallel
+        traffic streams without introducing congestion-triggered weaving.
+        """
+
+        target_options = tuple(
+            lane_index
+            for lane_index in target_lane_options
+            if 0 <= lane_index < target_edge.lanes
+        ) or tuple(range(target_edge.lanes))
+        cache_key = (
+            source_edge.id,
+            source_lane,
+            target_edge.id,
+            target_options,
+        )
+        cached_lane = self._lane_transition_cache.get(cache_key)
+        if cached_lane is not None:
+            return cached_lane
+
+        source_options = tuple(
+            lane_index
+            for lane_index in self._turn_lane_options(
+                source_edge, target_edge
+            )
+            if 0 <= lane_index < source_edge.lanes
+        ) or tuple(range(source_edge.lanes))
+        compatible_source_lane = self._nearest_lane(
+            min(max(0, source_lane), source_edge.lanes - 1),
+            source_options,
+        )
+        if len(target_options) == 1:
+            mapped_lane = target_options[0]
+            self._lane_transition_cache[cache_key] = mapped_lane
+            return mapped_lane
+        if len(source_options) > 1:
+            if (
+                len(source_options) != len(target_options)
+                and compatible_source_lane in target_options
+            ):
+                # A widening road does not require a lateral move.  Rank
+                # remapping is needed when equal compatible streams shift
+                # indices (the Bocskai 1,2 -> Nagyszolos 0,1 case), while a
+                # still-valid lane on a wider target should remain stable.
+                mapped_lane = compatible_source_lane
+                self._lane_transition_cache[cache_key] = mapped_lane
+                return mapped_lane
+            source_rank = source_options.index(compatible_source_lane)
+            target_rank = floor(
+                source_rank * (len(target_options) - 1)
+                / (len(source_options) - 1)
+                + 0.5
+            )
+            mapped_lane = target_options[target_rank]
+            self._lane_transition_cache[cache_key] = mapped_lane
+            return mapped_lane
+
+        turn_kind = _turn_kind(source_edge.bearing, target_edge.bearing)
+        if turn_kind == "left":
+            mapped_lane = target_options[0]
+        elif turn_kind == "right":
+            mapped_lane = target_options[-1]
+        else:
+            source_fraction = (
+                compatible_source_lane / (source_edge.lanes - 1)
+                if source_edge.lanes > 1
+                else 0.5
+            )
+            mapped_lane = min(
+                target_options,
+                key=lambda lane_index: (
+                    abs(
+                        lane_index / max(1, target_edge.lanes - 1)
+                        - source_fraction
+                    ),
+                    lane_index,
+                ),
+            )
+        self._lane_transition_cache[cache_key] = mapped_lane
+        return mapped_lane
+
+    def _build_merge_candidate_edge_ids(self) -> frozenset[str]:
+        """Return edges where distinct upstream lanes can actually converge."""
+
+        incoming_by_node: dict[int, list[NetworkEdge]] = {}
+        for edge in self.network.edges_by_mode["car"]:
+            incoming_by_node.setdefault(edge.to_node, []).append(edge)
+
+        candidate_ids: set[str] = set()
+        for target_edge in self.network.edges_by_mode["car"]:
+            incoming_edges = tuple(
+                incoming_edge
+                for incoming_edge in incoming_by_node.get(
+                    target_edge.from_node, ()
+                )
+                if not (
+                    target_edge.to_node == incoming_edge.from_node
+                    and target_edge.segment_id == incoming_edge.segment_id
+                )
+            )
+            if len(incoming_edges) > 1 or any(
+                incoming_edge.lanes > target_edge.lanes
+                for incoming_edge in incoming_edges
+            ):
+                candidate_ids.add(target_edge.id)
+                continue
+
+            # A turn-lane restriction on this edge can also collapse several
+            # current lanes onto one lane before its following turn. Keep such
+            # edges in the conservative merge set even with one predecessor.
+            if target_edge.turn_lanes and any(
+                len(self._turn_lane_options(target_edge, outgoing_edge))
+                < target_edge.lanes
+                for outgoing_edge in self.network.outgoing.get(
+                    (target_edge.to_node, "car"), ()
+                )
+            ):
+                candidate_ids.add(target_edge.id)
+        return frozenset(candidate_ids)
+
+    def _bounded_route_edges(
+        self,
+        route_edge_ids: tuple[str, ...],
+        start_index: int,
+        distance_limit: float = CAR_LENGTH_METERS,
+    ) -> tuple[NetworkEdge, ...]:
+        """Materialize only the headway-sized prefix plus one turn look-ahead."""
+
+        route_edges: list[NetworkEdge] = []
+        covered_distance = 0.0
+        look_ahead_pending = False
+        route_cursor = start_index
+        while route_cursor < len(route_edge_ids):
+            edge_id = route_edge_ids[route_cursor]
+            route_cursor += 1
+            route_edge = self.network.edges_by_id[edge_id]
+            route_edges.append(route_edge)
+            if look_ahead_pending:
+                break
+            covered_distance += route_edge.length_meters
+            if covered_distance >= distance_limit:
+                look_ahead_pending = True
+        return tuple(route_edges)
+
+    def _route_suffix_from_next(
+        self,
+        agent: NetworkAgent,
+        next_edge: NetworkEdge,
+        distance_limit: float = CAR_LENGTH_METERS,
+    ) -> tuple[NetworkEdge, ...]:
+        next_route_index = agent.route_index + 1
+        if (
+            agent.route_edge_ids
+            and 0 <= next_route_index < len(agent.route_edge_ids)
+            and agent.route_edge_ids[next_route_index] == next_edge.id
+        ):
+            # Headway only needs a car-length of geometry plus one look-ahead
+            # edge for the final lane mapping.  Materialising every remaining
+            # edge of every A-B route at 30 Hz caused avoidable allocation and
+            # CPU spikes on long routes.
+            return self._bounded_route_edges(
+                agent.route_edge_ids, next_route_index, distance_limit
+            )
+
+        # Route-less traffic still needs safe spacing on chains of OSM micro
+        # edges. Follow only an unambiguous continuation; at a branch the
+        # eventual random choice is not known yet, so admission is handled
+        # again after the next edge has been planned.
+        route_edges = [next_edge]
+        covered_distance = next_edge.length_meters
+        look_ahead_pending = covered_distance >= distance_limit
+        way_history = self.network.extend_way_history(
+            agent.way_history, next_edge.way_id
+        )
+        seen_edge_ids = {agent.edge.id, next_edge.id}
+        while True:
+            outgoing = self.network.allowed_outgoing(
+                route_edges[-1], agent.mode, way_history
+            )
+            candidates = tuple(
+                edge for edge in outgoing if edge.id not in seen_edge_ids
+            )
+            if len(candidates) != 1:
+                break
+            route_edge = candidates[0]
+            route_edges.append(route_edge)
+            if look_ahead_pending:
+                break
+            covered_distance += route_edge.length_meters
+            if covered_distance >= distance_limit:
+                look_ahead_pending = True
+            seen_edge_ids.add(route_edge.id)
+            way_history = self.network.extend_way_history(
+                way_history, route_edge.way_id
+            )
+        return tuple(route_edges)
+
+    def _mapped_route_lanes(
+        self,
+        agent: NetworkAgent,
+        route_edges: tuple[NetworkEdge, ...],
+        first_lane: int,
+    ) -> tuple[int, ...]:
+        if not route_edges:
+            return ()
+        lanes = [first_lane]
+        for edge_index, edge in enumerate(route_edges[:-1]):
+            next_edge = route_edges[edge_index + 1]
+            following_edge = (
+                route_edges[edge_index + 2]
+                if edge_index + 2 < len(route_edges)
+                else None
+            )
+            target_options = (
+                self._turn_lane_options(next_edge, following_edge)
+                if following_edge is not None
+                else tuple(range(next_edge.lanes))
+            )
+            lanes.append(
+                self._mapped_lane_for_transition(
+                    edge,
+                    lanes[-1],
+                    next_edge,
+                    target_options,
+                )
+            )
+        return tuple(lanes)
+
+    def _downstream_rear_distance(
+        self,
+        agent: NetworkAgent,
+        next_edge: NetworkEdge,
+        next_lane: int,
+        lane_positions: dict[tuple[str, int], dict[int, float]],
+    ) -> float | None:
+        """Return the nearest routed leader measured from next edge's start."""
+
+        cached_path = agent.car_headway_path_cache
+        if (
+            cached_path is not None
+            and cached_path[0] == agent.edge.id
+            and cached_path[1] == agent.route_index
+            and cached_path[2] is agent.route_edge_ids
+            and cached_path[3] == agent.planned_edge_id
+            and cached_path[4] == agent.way_history
+            and cached_path[5] == next_edge.id
+            and cached_path[6] == next_lane
+        ):
+            route_path = cached_path[7]
+        else:
+            route_edges = self._route_suffix_from_next(agent, next_edge)
+            route_lanes = self._mapped_route_lanes(
+                agent, route_edges, next_lane
+            )
+            route_path = tuple(zip(route_edges, route_lanes))
+            agent.car_headway_path_cache = (
+                agent.edge.id,
+                agent.route_index,
+                agent.route_edge_ids,
+                agent.planned_edge_id,
+                agent.way_history,
+                next_edge.id,
+                next_lane,
+                route_path,
+            )
+        return self._rear_distance_on_path(
+            agent.id, route_path, lane_positions
+        )
+
+    def _rear_distance_on_path(
+        self,
+        agent_id: int,
+        route_path: tuple[tuple[NetworkEdge, int], ...],
+        lane_positions: dict[tuple[str, int], dict[int, float]],
+    ) -> float | None:
+        distance_before_edge = 0.0
+        for edge, lane_index in route_path:
+            positions = lane_positions.get((edge.id, lane_index), {})
+            rear_distance: float | None = None
+            for positioned_agent_id, distance in positions.items():
+                if positioned_agent_id == agent_id:
+                    continue
+                if rear_distance is None or distance < rear_distance:
+                    rear_distance = distance
+            if rear_distance is not None:
+                if self.network.nodes[edge.to_node].traffic_signal:
+                    rear_distance = min(
+                        rear_distance,
+                        max(0.0, edge.length_meters - 0.25),
+                    )
+                return distance_before_edge + rear_distance
+            distance_before_edge += edge.length_meters
+        return None
+
+    def _initial_headway_reservations(
+        self, agent: NetworkAgent
+    ) -> tuple[tuple[str, int, float], ...]:
+        """Reserve the short downstream route occupied by a car's headway."""
+
+        next_edge = self.network.edges_by_id.get(agent.planned_edge_id or "")
+        remaining_headway = (
+            CAR_LENGTH_METERS
+            - (agent.edge.length_meters - agent.distance_meters)
+        )
+        if next_edge is None or remaining_headway <= 1e-9:
+            return ()
+        target_options = self._lane_options_after_entry(agent, next_edge)
+        first_lane = self._mapped_lane_for_transition(
+            agent.edge,
+            agent.lane_index,
+            next_edge,
+            target_options,
+        )
+        route_edges = self._route_suffix_from_next(agent, next_edge)
+        route_lanes = self._mapped_route_lanes(agent, route_edges, first_lane)
+        reservations: list[tuple[str, int, float]] = []
+        for edge, lane_index in zip(route_edges, route_lanes):
+            reservations.append(
+                (edge.id, lane_index, min(edge.length_meters, remaining_headway))
+            )
+            remaining_headway -= edge.length_meters
+            if remaining_headway <= 1e-9:
+                break
+        return tuple(reservations)
+
+    def _merge_approach_slots(
+        self,
+        agent: NetworkAgent,
+        lookahead_distance: float,
+        *,
+        merge_candidates_only: bool = True,
+    ) -> tuple[tuple[tuple[str, int], float, float], ...]:
+        """Return virtual lane coordinates along a short merge approach."""
+
+        if agent.mode != "car":
+            return ()
+        remaining_distance = agent.edge.length_meters - agent.distance_meters
+        if remaining_distance >= lookahead_distance:
+            return ()
+        cached_path = agent.car_merge_path_cache
+        if (
+            cached_path is not None
+            and cached_path[0] == agent.edge.id
+            and cached_path[1] == agent.route_index
+            and cached_path[2] is agent.route_edge_ids
+            and cached_path[3] == agent.planned_edge_id
+            and cached_path[4] == agent.way_history
+            and cached_path[7] >= lookahead_distance
+            and cached_path[9] == agent.lane_index
+        ):
+            route_path = cached_path[8]
+        else:
+            next_edge = self.network.edges_by_id.get(
+                agent.planned_edge_id or ""
+            )
+            if next_edge is None:
+                return ()
+            lane_options = self._lane_options_after_entry(agent, next_edge)
+            next_lane = self._mapped_lane_for_transition(
+                agent.edge,
+                agent.lane_index,
+                next_edge,
+                lane_options,
+            )
+            route_edges = self._route_suffix_from_next(
+                agent, next_edge, lookahead_distance
+            )
+            route_lanes = self._mapped_route_lanes(
+                agent, route_edges, next_lane
+            )
+            route_path = tuple(zip(route_edges, route_lanes))
+            agent.car_merge_path_cache = (
+                agent.edge.id,
+                agent.route_index,
+                agent.route_edge_ids,
+                agent.planned_edge_id,
+                agent.way_history,
+                next_edge.id,
+                next_lane,
+                lookahead_distance,
+                route_path,
+                agent.lane_index,
+            )
+        slots: list[tuple[tuple[str, int], float, float]] = []
+        distance_to_edge = remaining_distance
+        for route_edge, route_lane in route_path:
+            if distance_to_edge >= lookahead_distance:
+                break
+            if (
+                not merge_candidates_only
+                or route_edge.id in self._merge_candidate_edge_ids
+            ):
+                slots.append(
+                    (
+                        (route_edge.id, route_lane),
+                        -distance_to_edge,
+                        distance_to_edge,
+                    )
+                )
+            distance_to_edge += route_edge.length_meters
+        return tuple(slots)
 
     def _entry_lane(
         self,
@@ -3047,36 +3614,26 @@ class NetworkTrafficSimulation:
         next_edge: NetworkEdge,
         lane_positions: dict[tuple[str, int], dict[int, float]] | None,
     ) -> tuple[int, float | None] | None:
-        preferred_lane = min(agent.lane_index, next_edge.lanes - 1)
         lane_options = self._lane_options_after_entry(agent, next_edge)
-        if preferred_lane in lane_options:
-            # A momentarily occupied lane entrance is a queue, not a reason
-            # to weave into another otherwise equivalent lane. Short OSM
-            # edges made that fallback oscillate at every node in congestion.
-            ordered_lanes = (preferred_lane,)
-        else:
-            # A real turn-lane requirement or lane-count reduction may still
-            # force the smallest possible lane change.
-            ordered_lanes = tuple(sorted(
-                lane_options,
-                key=lambda lane_index: (
-                    abs(lane_index - preferred_lane),
-                    -lane_index,
-                ),
-            ))
+        preferred_lane = self._mapped_lane_for_transition(
+            agent.edge,
+            agent.lane_index,
+            next_edge,
+            lane_options,
+        )
+        # A momentarily occupied lane entrance is a queue, not a reason to
+        # weave.  The stable rank mapping above can still use every lane when
+        # lane counts change, but 2 -> 2 congestion never causes oscillation.
+        ordered_lanes = (preferred_lane,)
         if lane_positions is None or agent.mode != "car":
             return ordered_lanes[0], None
         for lane_index in ordered_lanes:
-            positions = lane_positions.get((next_edge.id, lane_index), {})
-            rear_distance = min(positions.values(), default=None)
-            if (
-                rear_distance is not None
-                and self.network.nodes[next_edge.to_node].traffic_signal
-            ):
-                rear_distance = min(
-                    rear_distance,
-                    max(0.0, next_edge.length_meters - 0.25),
-                )
+            rear_distance = self._downstream_rear_distance(
+                agent,
+                next_edge,
+                lane_index,
+                lane_positions,
+            )
             if (
                 rear_distance is None
                 or rear_distance >= CAR_LENGTH_METERS
@@ -3084,16 +3641,45 @@ class NetworkTrafficSimulation:
                 return lane_index, rear_distance
         return None
 
+    @staticmethod
+    def _localized_merge_limit(
+        agent: NetworkAgent, allowed_travel_meters: float
+    ) -> tuple[str, int, float]:
+        """Map a route-distance merge budget onto its concrete future edge."""
+
+        allowed_travel = max(0.0, allowed_travel_meters)
+        distance_to_edge_end = (
+            agent.edge.length_meters - agent.distance_meters
+        )
+        if allowed_travel < distance_to_edge_end - 1e-9:
+            return (
+                agent.edge.id,
+                agent.lane_index,
+                agent.distance_meters + allowed_travel,
+            )
+        remaining_travel = max(0.0, allowed_travel - distance_to_edge_end)
+        cached_path = agent.car_merge_path_cache
+        route_path = cached_path[8] if cached_path is not None else ()
+        for route_edge, route_lane in route_path:
+            if remaining_travel < route_edge.length_meters - 1e-9:
+                return route_edge.id, route_lane, remaining_travel
+            remaining_travel = max(
+                0.0, remaining_travel - route_edge.length_meters
+            )
+        return agent.edge.id, agent.lane_index, agent.edge.length_meters
+
     def _car_following_context(
-        self,
+        self, delta_seconds: float = 0.0,
     ) -> tuple[
         dict[int, tuple[str, int, float]],
         dict[tuple[str, int], dict[int, float]],
     ]:
         lane_groups: dict[tuple[str, int], list[NetworkAgent]] = {}
+        car_agents: list[NetworkAgent] = []
         for agent in self.agents:
             if agent.mode != "car":
                 continue
+            car_agents.append(agent)
             agent.lane_index = min(
                 max(0, agent.lane_index), agent.edge.lanes - 1
             )
@@ -3120,6 +3706,124 @@ class NetworkTrafficSimulation:
                     lane_key[1],
                     max(0.0, leader_reference - CAR_LENGTH_METERS),
                 )
+
+        # Front cars from several source lanes/edges may converge into the
+        # same target lane. Treat their remaining approach distance as a
+        # virtual negative target-lane coordinate. This reserves merge order
+        # before agent iteration, so list/id order cannot let two contenders
+        # enter an initially empty lane in the same tick.
+        merge_groups: dict[
+            tuple[str, int],
+            list[tuple[float, int, NetworkAgent, float]],
+        ] = {}
+        active_approaches: dict[tuple[str, int], int] = {}
+        near_front_agents: list[NetworkAgent] = []
+        delta = max(0.0, delta_seconds)
+        for agent in car_agents:
+            if agent.id in following_limits:
+                continue
+            lookahead_distance = (
+                CAR_LENGTH_METERS
+                + agent.desired_speed_mps * delta
+            )
+            if (
+                agent.edge.length_meters - agent.distance_meters
+                >= lookahead_distance
+            ):
+                continue
+            near_front_agents.append(agent)
+            for merge_key, merge_coordinate, distance_to_merge in (
+                self._merge_approach_slots(
+                    agent,
+                    lookahead_distance,
+                    merge_candidates_only=False,
+                )
+            ):
+                reserved_agent_id = active_approaches.get(merge_key)
+                if reserved_agent_id is None:
+                    active_approaches[merge_key] = agent.id
+                elif reserved_agent_id != agent.id:
+                    # Agent identifiers are positive; -1 compactly marks a
+                    # slot reserved by more than one approach.
+                    active_approaches[merge_key] = -1
+                if merge_key[0] in self._merge_candidate_edge_ids:
+                    merge_groups.setdefault(merge_key, []).append(
+                        (
+                            merge_coordinate,
+                            agent.id,
+                            agent,
+                            distance_to_merge,
+                        )
+                    )
+        self._active_merge_approaches = active_approaches
+        merge_travel_limits: dict[int, float] = {}
+        for contenders in merge_groups.values():
+            if len(contenders) < 2:
+                continue
+            contenders.sort(reverse=True, key=lambda item: (item[0], -item[1]))
+            for (leader_coordinate, _, _, _), (
+                _,
+                _,
+                follower,
+                follower_distance_to_merge,
+            ) in zip(
+                contenders, contenders[1:]
+            ):
+                allowed_travel = max(
+                    0.0,
+                    follower_distance_to_merge
+                    + leader_coordinate
+                    - CAR_LENGTH_METERS,
+                )
+                previous_travel_limit = merge_travel_limits.get(follower.id)
+                if (
+                    previous_travel_limit is None
+                    or allowed_travel < previous_travel_limit
+                ):
+                    merge_travel_limits[follower.id] = allowed_travel
+                    following_limits[follower.id] = (
+                        self._localized_merge_limit(
+                            follower, allowed_travel
+                        )
+                    )
+        for agent in near_front_agents:
+            existing_limit = following_limits.get(agent.id)
+            if (
+                existing_limit is not None
+                and existing_limit[0] == agent.edge.id
+                and existing_limit[1] == agent.lane_index
+            ):
+                continue
+            next_edge = self.network.edges_by_id.get(
+                agent.planned_edge_id or ""
+            )
+            if next_edge is None:
+                continue
+            target_options = self._lane_options_after_entry(agent, next_edge)
+            next_lane = self._mapped_lane_for_transition(
+                agent.edge,
+                agent.lane_index,
+                next_edge,
+                target_options,
+            )
+            rear_distance = self._downstream_rear_distance(
+                agent,
+                next_edge,
+                next_lane,
+                lane_positions,
+            )
+            if rear_distance is None or rear_distance >= CAR_LENGTH_METERS:
+                continue
+            following_limits[agent.id] = (
+                agent.edge.id,
+                agent.lane_index,
+                max(
+                    0.0,
+                    agent.edge.length_meters
+                    + rear_distance
+                    - CAR_LENGTH_METERS,
+                ),
+            )
         return following_limits, lane_positions
 
     @staticmethod
@@ -3149,6 +3853,63 @@ class NetworkTrafficSimulation:
         lane_positions.setdefault(
             (agent.edge.id, agent.lane_index), {}
         )[agent.id] = agent.distance_meters
+
+    def _upstream_entry_is_clear(
+        self,
+        agent: NetworkAgent,
+        target_edge: NetworkEdge,
+        target_lane: int,
+    ) -> bool:
+        """Protect a relocation/new POI route from active merge approaches."""
+
+        if self._active_merge_approaches is not None:
+            reserved_agent_id = self._active_merge_approaches.get(
+                (target_edge.id, target_lane)
+            )
+            return (
+                reserved_agent_id is None
+                or reserved_agent_id == agent.id
+            )
+
+        for other in self.agents:
+            if other.id == agent.id or other.mode != "car":
+                continue
+            remaining_distance = (
+                other.edge.length_meters - other.distance_meters
+            )
+            if remaining_distance >= CAR_LENGTH_METERS:
+                continue
+            other_next_edge = self.network.edges_by_id.get(
+                other.planned_edge_id or ""
+            )
+            if other_next_edge is None:
+                continue
+            other_options = self._lane_options_after_entry(
+                other, other_next_edge
+            )
+            other_lane = self._mapped_lane_for_transition(
+                other.edge,
+                other.lane_index,
+                other_next_edge,
+                other_options,
+            )
+            route_edges = self._route_suffix_from_next(
+                other, other_next_edge
+            )
+            route_lanes = self._mapped_route_lanes(
+                other, route_edges, other_lane
+            )
+            distance_to_edge = remaining_distance
+            for route_edge, route_lane in zip(route_edges, route_lanes):
+                if distance_to_edge >= CAR_LENGTH_METERS:
+                    break
+                if (
+                    route_edge.id == target_edge.id
+                    and route_lane == target_lane
+                ):
+                    return False
+                distance_to_edge += route_edge.length_meters
+        return True
 
     def _restart_agent_trip(
         self,
@@ -3181,33 +3942,33 @@ class NetworkTrafficSimulation:
                 continue
             lane_options = tuple(range(candidate_edge.lanes))
             if len(route_edge_ids) > 1:
-                lane_options = self.network.lane_options_for_turn(
+                lane_options = self._turn_lane_options(
                     candidate_edge,
                     self.network.edges_by_id[route_edge_ids[1]],
                 )
             clear_lanes = lane_options
+            rear_distance_by_lane: dict[int, float | None] = {}
             if agent.mode == "car" and lane_positions is not None:
                 clear_lane_values = []
+                route_edges = self._bounded_route_edges(route_edge_ids, 0)
                 for candidate_lane in lane_options:
-                    candidate_rear = min(
-                        lane_positions.get(
-                            (candidate_edge.id, candidate_lane), {}
-                        ).values(),
-                        default=None,
+                    route_lanes = self._mapped_route_lanes(
+                        agent, route_edges, candidate_lane
                     )
+                    candidate_rear = self._rear_distance_on_path(
+                        agent.id,
+                        tuple(zip(route_edges, route_lanes)),
+                        lane_positions,
+                    )
+                    rear_distance_by_lane[candidate_lane] = candidate_rear
                     if (
-                        candidate_rear is not None
-                        and self.network.nodes[
-                            candidate_edge.to_node
-                        ].traffic_signal
-                    ):
-                        candidate_rear = min(
-                            candidate_rear,
-                            max(0.0, candidate_edge.length_meters - 0.25),
+                        (
+                            candidate_rear is None
+                            or candidate_rear >= CAR_LENGTH_METERS
                         )
-                    if (
-                        candidate_rear is None
-                        or candidate_rear >= CAR_LENGTH_METERS
+                        and self._upstream_entry_is_clear(
+                            agent, candidate_edge, candidate_lane
+                        )
                     ):
                         clear_lane_values.append(candidate_lane)
                 clear_lanes = tuple(clear_lane_values)
@@ -3216,31 +3977,17 @@ class NetworkTrafficSimulation:
             selected_route = route
             first_edge = candidate_edge
             lane_index = self.random.choice(clear_lanes)
-            rear_distance = (
-                min(
-                    lane_positions.get((first_edge.id, lane_index), {}).values(),
-                    default=None,
-                )
-                if lane_positions is not None
-                else None
-            )
-            if (
-                rear_distance is not None
-                and self.network.nodes[first_edge.to_node].traffic_signal
-            ):
-                rear_distance = min(
-                    rear_distance,
-                    max(0.0, first_edge.length_meters - 0.25),
-                )
+            rear_distance = rear_distance_by_lane.get(lane_index)
             break
         if selected_route is None or first_edge is None:
             return False
         origin, destination, route_edge_ids = selected_route
         old_edge_id = agent.edge.id
         old_lane_index = agent.lane_index
+        desired_speed_mps = self._desired_speed_for_agent(agent, first_edge)
         agent.edge = first_edge
         agent.distance_meters = 0.0
-        agent.desired_speed_mps = self._desired_speed(first_edge, agent.mode)
+        agent.desired_speed_mps = desired_speed_mps
         agent.current_speed_mps = 0.0
         agent.lane_index = lane_index
         agent.planned_edge_id = None
@@ -3324,6 +4071,37 @@ class NetworkTrafficSimulation:
             # is occupied too close to its start for a safe merge.
             return False
         target_lane, rear_distance = entry_lane
+        if (
+            agent.route_index < 0
+            and not self._upstream_entry_is_clear(
+                agent, next_edge, target_lane
+            )
+        ):
+            return False
+        reserved_following_limit = (
+            following_limits.get(agent.id)
+            if following_limits is not None
+            else None
+        )
+        if (
+            reserved_following_limit is not None
+            and reserved_following_limit[0] == next_edge.id
+        ):
+            reserved_lane = min(
+                max(0, reserved_following_limit[1]),
+                next_edge.lanes - 1,
+            )
+            if reserved_lane != target_lane and lane_positions is not None:
+                reserved_rear = self._downstream_rear_distance(
+                    agent, next_edge, reserved_lane, lane_positions
+                )
+                if (
+                    reserved_rear is not None
+                    and reserved_rear < CAR_LENGTH_METERS
+                ):
+                    return False
+                rear_distance = reserved_rear
+            target_lane = reserved_lane
 
         if (
             agent.route_edge_ids
@@ -3335,25 +4113,37 @@ class NetworkTrafficSimulation:
             self._clear_route(agent)
         old_edge_id = agent.edge.id
         old_lane_index = agent.lane_index
+        old_edge_length = agent.edge.length_meters
+        desired_speed_mps = self._desired_speed_for_agent(agent, next_edge)
         agent.edge = next_edge
         agent.way_history = self.network.extend_way_history(
             agent.way_history, next_edge.way_id
         )
         agent.distance_meters = 0.0
-        agent.desired_speed_mps = self._desired_speed(next_edge, agent.mode)
+        agent.desired_speed_mps = desired_speed_mps
         agent.signal_checked = False
         agent.lane_index = target_lane
         self._move_occupancy(
             occupancy, agent.mode, old_edge_id, next_edge.id
         )
-        if agent.mode == "car":
-            self._remove_lane_position(
-                lane_positions,
-                old_edge_id,
-                old_lane_index,
-                agent.id,
-            )
+        if agent.mode == "car" and lane_positions is not None:
+            # Keep a departure ghost for the remainder of this tick. It
+            # closes the race where the same car clears a micro edge before a
+            # later contender from another approach checks that target lane.
+            lane_positions.setdefault(
+                (old_edge_id, old_lane_index), {}
+            )[agent.id] = old_edge_length
         self._plan_next(agent)
+        if (
+            reserved_following_limit is not None
+            and reserved_following_limit[0] == next_edge.id
+        ):
+            # The merge reservation was localized onto this future edge.
+            # Preserve its mapped lane across the immediate post-entry plan.
+            agent.lane_index = min(
+                max(0, reserved_following_limit[1]),
+                next_edge.lanes - 1,
+            )
         if agent.mode == "car" and agent.lane_index != target_lane:
             planned_positions = (
                 lane_positions.get((next_edge.id, agent.lane_index), {})
@@ -3378,12 +4168,27 @@ class NetworkTrafficSimulation:
                 rear_distance = planned_rear
         if following_limits is not None:
             following_limits.pop(agent.id, None)
+            next_following_limit = (
+                reserved_following_limit
+                if reserved_following_limit is not None
+                and reserved_following_limit[0] != old_edge_id
+                else None
+            )
             if rear_distance is not None:
-                following_limits[agent.id] = (
+                rear_limit = (
                     next_edge.id,
                     agent.lane_index,
                     max(0.0, rear_distance - CAR_LENGTH_METERS),
                 )
+                if (
+                    next_following_limit is None
+                    or next_following_limit[0] != next_edge.id
+                    or next_following_limit[1] != agent.lane_index
+                    or rear_limit[2] < next_following_limit[2]
+                ):
+                    next_following_limit = rear_limit
+            if next_following_limit is not None:
+                following_limits[agent.id] = next_following_limit
         self._set_lane_position(lane_positions, agent)
         return True
 
@@ -3451,11 +4256,24 @@ class NetworkTrafficSimulation:
                 agent.wait_seconds = self._poi_dwell_seconds(
                     origin.poi, agent.mode
                 )
-                return self._enter_next_edge(
+                entered = self._enter_next_edge(
                     agent,
                     occupancy,
                     lane_positions,
                     following_limits,
+                )
+                if entered:
+                    return True
+                # The route becomes known only at the POI located at this
+                # edge end. Rewinding the car by a headway here would be a
+                # visible backwards teleport. Pick a safe relocation instead;
+                # relocation_generation tells the client not to interpolate.
+                return self._restart_agent_trip(
+                    agent,
+                    prefer_gateway=False,
+                    occupancy=occupancy,
+                    lane_positions=lane_positions,
+                    following_limits=following_limits,
                 )
 
         self._clear_route(agent)
@@ -3487,18 +4305,94 @@ class NetworkTrafficSimulation:
             agent, occupancy, lane_positions, following_limits
         )
 
+    def _car_density_window(
+        self,
+        agent: NetworkAgent,
+        occupancy: dict[tuple[str, str], int],
+        density_cache: dict[tuple[str, ...], float],
+    ) -> float:
+        cached_window = agent.car_density_window_cache
+        if (
+            cached_window is not None
+            and cached_window[0] == agent.edge.id
+            and cached_window[1] == agent.route_index
+            and cached_window[2] is agent.route_edge_ids
+            and cached_window[3] == agent.planned_edge_id
+        ):
+            edge_ids = cached_window[4]
+            covered_distance = cached_window[5]
+            lane_meters = cached_window[6]
+        else:
+            window_edge_ids = [agent.edge.id]
+            covered_distance = agent.edge.length_meters
+            lane_meters = agent.edge.lanes * agent.edge.length_meters
+            if (
+                agent.route_edge_ids
+                and 0 <= agent.route_index < len(agent.route_edge_ids)
+                and agent.route_edge_ids[agent.route_index] == agent.edge.id
+            ):
+                candidate_ids = agent.route_edge_ids
+                candidate_index = agent.route_index + 1
+            elif agent.planned_edge_id:
+                candidate_ids = (agent.planned_edge_id,)
+                candidate_index = 0
+            else:
+                candidate_ids = ()
+                candidate_index = 0
+            while candidate_index < len(candidate_ids):
+                if covered_distance >= MIN_CAR_DENSITY_WINDOW_METERS:
+                    break
+                edge_id = candidate_ids[candidate_index]
+                candidate_index += 1
+                if edge_id in window_edge_ids:
+                    break
+                route_edge = self.network.edges_by_id.get(edge_id)
+                if route_edge is None:
+                    break
+                window_edge_ids.append(edge_id)
+                covered_distance += route_edge.length_meters
+                lane_meters += route_edge.lanes * route_edge.length_meters
+            edge_ids = tuple(window_edge_ids)
+            agent.car_density_window_cache = (
+                agent.edge.id,
+                agent.route_index,
+                agent.route_edge_ids,
+                agent.planned_edge_id,
+                edge_ids,
+                covered_distance,
+                lane_meters,
+            )
+
+        cached_density = density_cache.get(edge_ids)
+        if cached_density is not None:
+            return cached_density
+        car_count = sum(
+            occupancy.get(("car", edge_id), 0) for edge_id in edge_ids
+        )
+        if covered_distance < MIN_CAR_DENSITY_WINDOW_METERS:
+            lane_meters += (
+                MIN_CAR_DENSITY_WINDOW_METERS - covered_distance
+            ) * self.network.edges_by_id[edge_ids[-1]].lanes
+        density = car_count / max(1.0, lane_meters / CAR_LENGTH_METERS)
+        density_cache[edge_ids] = density
+        return density
+
     def _effective_speed(
         self,
         agent: NetworkAgent,
         occupancy: dict[tuple[str, str], int],
+        density_cache: dict[tuple[str, ...], float] | None = None,
     ) -> float:
-        count = occupancy.get((agent.mode, agent.edge.id), 1)
-        capacity = (
-            max(1.0, agent.edge.lanes * agent.edge.length_meters / CAR_LENGTH_METERS)
-            if agent.mode == "car"
-            else max(2.0, agent.edge.length_meters / 1.5)
-        )
-        density = count / capacity
+        if agent.mode == "car":
+            density = self._car_density_window(
+                agent,
+                occupancy,
+                density_cache if density_cache is not None else {},
+            )
+        else:
+            count = occupancy.get((agent.mode, agent.edge.id), 1)
+            capacity = max(2.0, agent.edge.length_meters / 1.5)
+            density = count / capacity
         slowdown = (
             1 / (1 + 4.2 * max(0.0, density - 0.18) ** 1.6)
             if agent.mode == "car"
@@ -3519,7 +4413,9 @@ class NetworkTrafficSimulation:
         for agent in self.agents:
             key = (agent.mode, agent.edge.id)
             occupancy[key] = occupancy.get(key, 0) + 1
-        following_limits, lane_positions = self._car_following_context()
+        density_occupancy = dict(occupancy)
+        following_limits, lane_positions = self._car_following_context(delta)
+        car_density_cache: dict[tuple[str, ...], float] = {}
 
         for agent in self.agents:
             remaining_seconds = delta
@@ -3533,7 +4429,9 @@ class NetworkTrafficSimulation:
 
             transitions = 0
             while remaining_seconds > 1e-9 and transitions < 256:
-                speed = self._effective_speed(agent, occupancy)
+                speed = self._effective_speed(
+                    agent, density_occupancy, car_density_cache
+                )
                 if speed <= 1e-9:
                     agent.current_speed_mps = 0.0
                     break
@@ -3582,10 +4480,13 @@ class NetworkTrafficSimulation:
                         stop_distance = max(
                             0.0, agent.edge.length_meters - 0.25
                         )
-                        travelled = max(
-                            0.0, stop_distance - agent.distance_meters
+                        stopped_distance = max(
+                            agent.distance_meters, stop_distance
                         )
-                        agent.distance_meters = stop_distance
+                        travelled = max(
+                            0.0, stopped_distance - agent.distance_meters
+                        )
+                        agent.distance_meters = stopped_distance
                         agent.trip_distance_meters += travelled
                         self._set_lane_position(lane_positions, agent)
                         agent.wait_seconds = cycle - phase
@@ -3600,6 +4501,7 @@ class NetworkTrafficSimulation:
                 self._set_lane_position(lane_positions, agent)
                 remaining_seconds -= seconds_to_end
                 transitions += 1
+                completed_edge = agent.edge
                 if not self._advance_from_edge_end(
                     agent,
                     occupancy,
@@ -3620,12 +4522,115 @@ class NetworkTrafficSimulation:
                             following_limits=following_limits,
                         )
                     break
+                if agent.mode == "car":
+                    self.segment_passed_cars[completed_edge.segment_id] += 1
                 agent.current_speed_mps = speed
 
             if not agent.route_edge_ids and agent.trip_distance_meters >= agent.trip_target_meters:
                 self.completed_trips += 1
                 agent.trip_distance_meters = 0.0
                 agent.trip_target_meters = self._trip_target(agent.mode)
+        self._active_merge_approaches = None
+        self._record_segment_metrics(delta)
+
+    def _current_segment_car_metrics(
+        self,
+    ) -> dict[str, tuple[float, float, float]]:
+        metrics: dict[str, list[float]] = {}
+        for agent in self.agents:
+            if agent.mode != "car":
+                continue
+            segment_id = agent.edge.segment_id
+            values = metrics.setdefault(segment_id, [0.0, 0.0, 0.0])
+            speed_mps = max(0.0, agent.current_speed_mps)
+            speed_limit_mps = max(1e-9, agent.edge.max_speed_kph / 3.6)
+            values[0] += speed_mps
+            values[1] += _clamp(speed_mps / speed_limit_mps, 0.0, 1.5)
+            values[2] += 1.0
+        return {
+            segment_id: (values[0], values[1], values[2])
+            for segment_id, values in metrics.items()
+        }
+
+    def _record_segment_metrics(self, delta_seconds: float) -> None:
+        delta = max(0.0, float(delta_seconds))
+        samples = self._current_segment_car_metrics()
+        bucket = {
+            segment_id: (
+                speed_sum * delta,
+                ratio_sum * delta,
+                vehicle_count * delta,
+            )
+            for segment_id, (speed_sum, ratio_sum, vehicle_count) in samples.items()
+        }
+        if bucket:
+            self._segment_metric_buckets.append((self.elapsed_seconds, bucket))
+            for segment_id, values in bucket.items():
+                totals = self._segment_metric_totals.setdefault(
+                    segment_id, [0.0, 0.0, 0.0]
+                )
+                for index, value in enumerate(values):
+                    totals[index] += value
+
+        cutoff = self.elapsed_seconds - SEGMENT_STAT_WINDOW_SECONDS
+        while self._segment_metric_buckets and self._segment_metric_buckets[0][0] <= cutoff:
+            _, expired = self._segment_metric_buckets.popleft()
+            for segment_id, values in expired.items():
+                totals = self._segment_metric_totals.get(segment_id)
+                if totals is None:
+                    continue
+                for index, value in enumerate(values):
+                    totals[index] -= value
+                if totals[2] <= 1e-9:
+                    self._segment_metric_totals.pop(segment_id, None)
+
+    def segment_statistics(
+        self,
+        *,
+        segment_id: str | None = None,
+        include_segment_id: str | None = None,
+    ) -> dict[str, Any]:
+        current = self._current_segment_car_metrics()
+        if segment_id is not None:
+            segment_ids = {str(segment_id)}
+        else:
+            segment_ids = set(self._segment_metric_totals) | set(current)
+            if include_segment_id is not None:
+                segment_ids.add(str(include_segment_id))
+
+        records: dict[str, list[int | float]] = {}
+        for current_segment_id in segment_ids:
+            totals = self._segment_metric_totals.get(current_segment_id)
+            current_values = current.get(current_segment_id, (0.0, 0.0, 0.0))
+            vehicle_seconds = max(0.0, totals[2]) if totals is not None else 0.0
+            if vehicle_seconds > 1e-9:
+                average_speed_mps = totals[0] / vehicle_seconds
+                speed_ratio = totals[1] / vehicle_seconds
+            elif current_values[2] > 0:
+                average_speed_mps = current_values[0] / current_values[2]
+                speed_ratio = current_values[1] / current_values[2]
+            else:
+                average_speed_mps = 0.0
+                speed_ratio = 0.0
+            has_recent_traffic = vehicle_seconds > 1e-9 or current_values[2] > 0
+            load_percent = (
+                _clamp((1.0 - speed_ratio) * 100.0, 0.0, 100.0)
+                if has_recent_traffic
+                else 0.0
+            )
+            records[current_segment_id] = [
+                int(self.segment_passed_cars.get(current_segment_id, 0)),
+                int(current_values[2]),
+                round(average_speed_mps * 3.6, 2),
+                round(_clamp(speed_ratio, 0.0, 1.5), 4),
+                round(load_percent, 2),
+                round(vehicle_seconds, 2),
+            ]
+        return {
+            "windowSeconds": SEGMENT_STAT_WINDOW_SECONDS,
+            "elapsedSeconds": self.elapsed_seconds,
+            "segments": records,
+        }
 
     def _agent_position(self, agent: NetworkAgent) -> tuple[float, float]:
         ratio = _clamp(agent.distance_meters / agent.edge.length_meters, 0.0, 1.0)

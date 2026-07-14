@@ -228,6 +228,13 @@ class NetworkCapacityRegressionTests(unittest.TestCase):
         self.simulation.step(0.01)
 
         self.assertIs(leaving_car.edge, self.exit)
+        self.assertIs(first_waiting_car.edge, self.source)
+        self.assertIs(second_waiting_car.edge, self.source)
+
+        # The departed target position is retained as a one-tick reservation;
+        # the first queued car can enter as soon as the next context rebuilds.
+        self.simulation.step(0.01)
+
         self.assertIs(first_waiting_car.edge, self.target)
         self.assertIs(second_waiting_car.edge, self.source)
         self.assertEqual(second_waiting_car.planned_edge_id, self.target.id)

@@ -1,5 +1,7 @@
 const BACKGROUND_COLOR = "#111b18";
+const OUTSIDE_BACKGROUND_COLOR = "#000000";
 const DETAILED_ROAD_MIN_ZOOM = 2.4;
+const SPATIAL_GRID_CELL_SIZE = 250;
 
 const MODE_STYLES = [
   { color: "#a7704c", alpha: 0.86, dash: [] },
@@ -18,6 +20,8 @@ let segmentCarSupport = null;
 let turnGeometry = null;
 let turnLaneData = null;
 let turnDirections = null;
+let segmentSpatialIndex = null;
+let turnSpatialIndex = null;
 let renderCanvas = null;
 let renderContext = null;
 
@@ -40,6 +44,110 @@ function roadVisible(index, zoom) {
   return fraction >= 1 || (fraction > 0 && segmentLodRanks[index] < fraction);
 }
 
+function buildSpatialIndex(geometry, count) {
+  const grid = new Map();
+  const marks = new Uint32Array(count);
+  const unindexed = [];
+  for (let index = 0; index < count; index += 1) {
+    const offset = index * 4;
+    const startX = Number(geometry[offset]);
+    const startY = Number(geometry[offset + 1]);
+    const endX = Number(geometry[offset + 2]);
+    const endY = Number(geometry[offset + 3]);
+    if (![startX, startY, endX, endY].every(Number.isFinite)) {
+      unindexed.push(index);
+      continue;
+    }
+    const firstColumn = Math.floor(Math.min(startX, endX) / SPATIAL_GRID_CELL_SIZE);
+    const lastColumn = Math.floor(Math.max(startX, endX) / SPATIAL_GRID_CELL_SIZE);
+    const firstRow = Math.floor(Math.min(startY, endY) / SPATIAL_GRID_CELL_SIZE);
+    const lastRow = Math.floor(Math.max(startY, endY) / SPATIAL_GRID_CELL_SIZE);
+    for (let column = firstColumn; column <= lastColumn; column += 1) {
+      for (let row = firstRow; row <= lastRow; row += 1) {
+        const key = `${column}:${row}`;
+        let cell = grid.get(key);
+        if (!cell) {
+          cell = { column, row, indices: [] };
+          grid.set(key, cell);
+        }
+        cell.indices.push(index);
+      }
+    }
+  }
+  return {
+    grid,
+    cells: [...grid.values()],
+    marks,
+    generation: 0,
+    unindexed,
+  };
+}
+
+function spatialCandidates(index, view, margin) {
+  if (!index || !Number.isFinite(view?.scale) || view.scale <= 0) {
+    return [];
+  }
+  const horizontalReach = view.width / 2 + view.padding + margin;
+  const verticalReach = view.height / 2 + view.padding + margin;
+  const minimumX = view.centerX - horizontalReach / view.scale;
+  const maximumX = view.centerX + horizontalReach / view.scale;
+  const minimumY = view.centerY - verticalReach / view.scale;
+  const maximumY = view.centerY + verticalReach / view.scale;
+  const firstColumn = Math.floor(minimumX / SPATIAL_GRID_CELL_SIZE);
+  const lastColumn = Math.floor(maximumX / SPATIAL_GRID_CELL_SIZE);
+  const firstRow = Math.floor(minimumY / SPATIAL_GRID_CELL_SIZE);
+  const lastRow = Math.floor(maximumY / SPATIAL_GRID_CELL_SIZE);
+  const columnCount = Math.max(0, lastColumn - firstColumn + 1);
+  const rowCount = Math.max(0, lastRow - firstRow + 1);
+  const queryCellCount = columnCount * rowCount;
+
+  index.generation = (index.generation + 1) >>> 0;
+  if (index.generation === 0) {
+    index.marks.fill(0);
+    index.generation = 1;
+  }
+  const generation = index.generation;
+  const candidates = [];
+  const appendCell = (cell) => {
+    for (const candidate of cell?.indices || []) {
+      if (index.marks[candidate] === generation) {
+        continue;
+      }
+      index.marks[candidate] = generation;
+      candidates.push(candidate);
+    }
+  };
+
+  // Large overview views can cover more empty grid cells than populated ones.
+  // In that case walking the compact populated-cell list avoids a huge sparse
+  // nested loop while retaining the same exact candidate set.
+  if (queryCellCount > index.cells.length * 2) {
+    for (const cell of index.cells) {
+      if (
+        cell.column >= firstColumn
+        && cell.column <= lastColumn
+        && cell.row >= firstRow
+        && cell.row <= lastRow
+      ) {
+        appendCell(cell);
+      }
+    }
+  } else {
+    for (let column = firstColumn; column <= lastColumn; column += 1) {
+      for (let row = firstRow; row <= lastRow; row += 1) {
+        appendCell(index.grid.get(`${column}:${row}`));
+      }
+    }
+  }
+  for (const candidate of index.unindexed) {
+    if (index.marks[candidate] !== generation) {
+      index.marks[candidate] = generation;
+      candidates.push(candidate);
+    }
+  }
+  return candidates;
+}
+
 function projectX(worldX, view) {
   return (worldX - view.centerX) * view.scale + view.width / 2;
 }
@@ -59,8 +167,7 @@ function lineVisible(startX, startY, endX, endY, view, margin) {
 
 function drawOverview(context, view) {
   const groups = new Map();
-  const count = segmentWidths.length;
-  for (let index = 0; index < count; index += 1) {
+  for (const index of spatialCandidates(segmentSpatialIndex, view, 20)) {
     if (!roadVisible(index, view.zoom)) {
       continue;
     }
@@ -99,8 +206,7 @@ function drawDetailedRoads(context, view) {
   const laneWidth = clamp(1.35 + Math.sqrt(view.zoom) * 0.55, 2, 5.2);
   const roadGroups = new Map();
   const laneDividerGroups = new Map();
-  const count = segmentWidths.length;
-  for (let index = 0; index < count; index += 1) {
+  for (const index of spatialCandidates(segmentSpatialIndex, view, 40)) {
     if (!roadVisible(index, view.zoom)) {
       continue;
     }
@@ -229,7 +335,7 @@ function drawTurnArrows(context, view) {
     return;
   }
   const laneWidth = clamp(1.35 + Math.sqrt(view.zoom) * 0.55, 2, 5.2);
-  for (let index = 0; index < turnDirections.length; index += 1) {
+  for (const index of spatialCandidates(turnSpatialIndex, view, 30)) {
     const geometryOffset = index * 4;
     const laneOffset = index * 2;
     const startX = projectX(turnGeometry[geometryOffset], view);
@@ -260,6 +366,49 @@ function drawTurnArrows(context, view) {
   }
 }
 
+function normalizedMapBounds(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const minimumX = Number(value.minimumX ?? value.minX ?? 0);
+  const minimumY = Number(value.minimumY ?? value.minY ?? 0);
+  const maximumX = Number(value.maximumX ?? value.maxX ?? value.worldWidth);
+  const maximumY = Number(value.maximumY ?? value.maxY ?? value.worldHeight);
+  if (![minimumX, minimumY, maximumX, maximumY].every(Number.isFinite)) {
+    return null;
+  }
+  return {
+    minimumX: Math.min(minimumX, maximumX),
+    minimumY: Math.min(minimumY, maximumY),
+    maximumX: Math.max(minimumX, maximumX),
+    maximumY: Math.max(minimumY, maximumY),
+  };
+}
+
+function drawBackground(context, view, rawMapBounds) {
+  const logicalWidth = view.width + view.padding * 2;
+  const logicalHeight = view.height + view.padding * 2;
+  const mapBounds = normalizedMapBounds(rawMapBounds);
+  if (!mapBounds) {
+    context.fillStyle = BACKGROUND_COLOR;
+    context.fillRect(-view.padding, -view.padding, logicalWidth, logicalHeight);
+    return;
+  }
+  context.fillStyle = OUTSIDE_BACKGROUND_COLOR;
+  context.fillRect(-view.padding, -view.padding, logicalWidth, logicalHeight);
+  const firstX = projectX(mapBounds.minimumX, view);
+  const firstY = projectY(mapBounds.minimumY, view);
+  const lastX = projectX(mapBounds.maximumX, view);
+  const lastY = projectY(mapBounds.maximumY, view);
+  context.fillStyle = BACKGROUND_COLOR;
+  context.fillRect(
+    Math.min(firstX, lastX),
+    Math.min(firstY, lastY),
+    Math.abs(lastX - firstX),
+    Math.abs(lastY - firstY),
+  );
+}
+
 function drawPois(context, view, pois) {
   if (!pois?.length) {
     return;
@@ -267,7 +416,6 @@ function drawPois(context, view, pois) {
   const radius = clamp(2.4 + Math.log2(view.zoom + 1) * 0.45, 3, 5.2);
   const markerGroups = new Map();
   const markerOutline = new Path2D();
-  const labels = [];
   for (const poi of pois) {
     const x = projectX(poi.x, view);
     const y = projectY(poi.y, view);
@@ -287,9 +435,6 @@ function drawPois(context, view, pois) {
     const path = markerGroups.get(poi.color);
     path.moveTo(x + radius, y);
     path.arc(x, y, radius, 0, Math.PI * 2);
-    if (poi.label && poi.name) {
-      labels.push({ name: poi.name, x, y });
-    }
   }
 
   context.save();
@@ -302,19 +447,6 @@ function drawPois(context, view, pois) {
     context.fillStyle = color;
     context.fill(path);
     context.stroke(path);
-  }
-  context.font = "600 10px 'Segoe UI', system-ui, sans-serif";
-  for (const labelEntry of labels) {
-    const label = labelEntry.name.length > 30
-      ? `${labelEntry.name.slice(0, 29)}…`
-      : labelEntry.name;
-    const textWidth = context.measureText(label).width;
-    const labelX = labelEntry.x + radius + 5;
-    const labelY = labelEntry.y + 3.5;
-    context.fillStyle = "rgba(5, 14, 12, 0.82)";
-    context.fillRect(labelX - 3, labelY - 10, textWidth + 6, 14);
-    context.fillStyle = "rgba(237, 248, 243, 0.9)";
-    context.fillText(label, labelX, labelY);
   }
   context.restore();
 }
@@ -340,13 +472,7 @@ function renderStaticMap(message) {
     view.padding * view.pixelRatio,
     view.padding * view.pixelRatio,
   );
-  renderContext.fillStyle = BACKGROUND_COLOR;
-  renderContext.fillRect(
-    -view.padding,
-    -view.padding,
-    logicalWidth,
-    logicalHeight,
-  );
+  drawBackground(renderContext, view, message.mapBounds);
   if (view.zoom < DETAILED_ROAD_MIN_ZOOM) {
     drawOverview(renderContext, view);
   } else {
@@ -375,6 +501,8 @@ self.addEventListener("message", (event) => {
       turnGeometry = message.turnGeometry;
       turnLaneData = message.turnLaneData;
       turnDirections = message.turnDirections;
+      segmentSpatialIndex = buildSpatialIndex(segmentGeometry, segmentWidths.length);
+      turnSpatialIndex = buildSpatialIndex(turnGeometry, turnDirections.length);
       self.postMessage({ type: "ready" });
       return;
     }

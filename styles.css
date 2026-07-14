@@ -409,24 +409,33 @@ input[type="range"] {
   margin-bottom: 19px;
 }
 
-.agent-color-controls {
+.agent-color-controls,
+.traffic-heatmap-controls,
+.map-render-controls {
   display: grid;
   gap: 7px;
-  margin: 0 0 17px;
   padding: 10px;
   border: 1px solid rgba(216, 238, 229, 0.1);
   border-radius: 10px;
   background: rgba(6, 16, 13, 0.38);
 }
 
-.agent-color-controls legend {
+.agent-color-controls { margin: 0 0 17px; }
+.traffic-heatmap-controls { margin: -7px 0 17px; }
+.map-render-controls { margin: 0 0 13px; }
+
+.agent-color-controls legend,
+.traffic-heatmap-controls legend,
+.map-render-controls legend {
   padding: 0 4px;
   color: #cbd9d3;
   font-size: 0.7rem;
   font-weight: 650;
 }
 
-.agent-color-toggle {
+.agent-color-toggle,
+.traffic-heatmap-toggle,
+.map-render-toggle {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -437,7 +446,9 @@ input[type="range"] {
   cursor: pointer;
 }
 
-.agent-color-toggle span {
+.agent-color-toggle span,
+.traffic-heatmap-toggle span,
+.map-render-toggle span {
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -453,7 +464,9 @@ input[type="range"] {
 .car-swatch { background: var(--orange); }
 .pedestrian-swatch { background: var(--cyan); }
 
-.agent-color-toggle input {
+.agent-color-toggle input,
+.traffic-heatmap-toggle input,
+.map-render-toggle input {
   position: relative;
   flex: 0 0 auto;
   width: 32px;
@@ -467,7 +480,9 @@ input[type="range"] {
   transition: border-color 140ms ease, background 140ms ease;
 }
 
-.agent-color-toggle input::after {
+.agent-color-toggle input::after,
+.traffic-heatmap-toggle input::after,
+.map-render-toggle input::after {
   position: absolute;
   top: 2px;
   left: 2px;
@@ -479,36 +494,76 @@ input[type="range"] {
   transition: transform 140ms ease, background 140ms ease;
 }
 
-.agent-color-toggle input:checked {
+.agent-color-toggle input:checked,
+.traffic-heatmap-toggle input:checked,
+.map-render-toggle input:checked {
   border-color: rgba(168, 240, 75, 0.48);
   background: rgba(168, 240, 75, 0.16);
 }
 
-.agent-color-toggle input:checked::after {
+.agent-color-toggle input:checked::after,
+.traffic-heatmap-toggle input:checked::after,
+.map-render-toggle input:checked::after {
   background: var(--green);
   transform: translateX(14px);
 }
 
-.agent-color-toggle input:focus-visible {
+.agent-color-toggle input:focus-visible,
+.traffic-heatmap-toggle input:focus-visible,
+.map-render-toggle input:focus-visible {
   outline: 2px solid rgba(168, 240, 75, 0.72);
   outline-offset: 2px;
 }
 
-.agent-color-controls p {
+.agent-color-controls p,
+.traffic-heatmap-controls p,
+.map-render-controls p {
   margin: 1px 0 0;
   color: #6f847c;
   font-size: 0.58rem;
   line-height: 1.35;
 }
 
+.traffic-heatmap-scale {
+  display: grid;
+  grid-template-columns: auto minmax(54px, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  color: #7f918a;
+  font-size: 0.56rem;
+}
+
+.traffic-heatmap-scale i {
+  display: block;
+  height: 5px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #35c86f, #f3cc45 50%, #ef4e4e);
+}
+
+.map-render-status {
+  display: block;
+  margin-top: 1px;
+  color: var(--muted);
+  font-size: 0.6rem;
+  line-height: 1.4;
+}
+
+.map-render-controls[aria-busy="true"] .map-render-status {
+  color: var(--green);
+}
+
 @media (forced-colors: active) {
-  .agent-color-toggle input {
+  .agent-color-toggle input,
+  .traffic-heatmap-toggle input,
+  .map-render-toggle input {
     width: 18px;
     height: 18px;
     appearance: auto;
   }
 
-  .agent-color-toggle input::after {
+  .agent-color-toggle input::after,
+  .traffic-heatmap-toggle input::after,
+  .map-render-toggle input::after {
     display: none;
   }
 }
@@ -655,6 +710,46 @@ select {
   background: #17221f;
 }
 
+#map.local-map-full-render {
+  background: #000;
+}
+
+.local-map-viewport-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  transform: matrix(1, 0, 0, 1, 0, 0);
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.local-map-tile-layer {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+  transform: matrix(1, 0, 0, 1, 0, 0);
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.local-map-tile-layer[hidden] {
+  display: none;
+}
+
+.local-map-tile-slot {
+  position: absolute;
+  overflow: hidden;
+  contain: strict;
+}
+
+.local-map-tile-canvas {
+  position: absolute;
+  pointer-events: none;
+  contain: strict;
+}
+
 .local-map-canvas,
 .agent-canvas-overlay {
   position: absolute;
@@ -662,7 +757,6 @@ select {
   left: 0;
   pointer-events: none;
   contain: strict;
-  will-change: transform;
 }
 
 #map:active {
@@ -675,6 +769,15 @@ select {
 
 .local-map-agents {
   z-index: 1;
+  transform: matrix(1, 0, 0, 1, 0, 0);
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.local-map-heatmap,
+.local-map-poi-labels {
+  transform: matrix(1, 0, 0, 1, 0, 0);
+  transform-origin: 0 0;
 }
 
 .dataset-summary {
@@ -933,6 +1036,13 @@ select {
   height: 9px;
   border: 1px solid rgba(237, 248, 243, 0.72);
   background: #ffca62;
+}
+
+.legend .legend-traffic-heatmap {
+  width: 28px;
+  height: 5px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #35c86f, #f3cc45 50%, #ef4e4e);
 }
 
 .walking-warning {

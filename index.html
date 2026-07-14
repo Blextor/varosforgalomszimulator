@@ -35,6 +35,40 @@
             <span class="dataset-dot" aria-hidden="true"></span>
             <span id="network-details">Nincs külső térképes API-forgalom.</span>
           </div>
+          <fieldset class="map-render-controls" aria-describedby="map-render-help">
+            <legend>Megjelenítési teljesítmény</legend>
+            <label class="map-render-toggle" for="prepare-all-map-layers">
+              <span>Minden részletességi szint előkészítése</span>
+              <input
+                id="prepare-all-map-layers"
+                type="checkbox"
+                role="switch"
+                aria-describedby="map-render-help"
+              />
+            </label>
+            <label class="map-render-toggle" for="render-full-map">
+              <span>Teljes kerület előrajzolása</span>
+              <input
+                id="render-full-map"
+                type="checkbox"
+                role="switch"
+                aria-describedby="map-render-help"
+              />
+            </label>
+            <output
+              id="map-render-status"
+              class="map-render-status"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              Takarékos mód · csak a látható környezet készül el.
+            </output>
+            <p id="map-render-help">
+              A gyorsított mód több memóriát használ. A teljes térkép opció a képernyőn kívüli
+              területet is elkészíti egy kis fekete margóval; gyengébb gépen hagyd kikapcsolva.
+            </p>
+          </fieldset>
           <button id="reload-network" class="secondary-button dataset-button" type="button">
             Térkép újratöltése
           </button>
@@ -54,8 +88,8 @@
               <label for="car-count">Autók</label>
               <output id="car-count-value" for="car-count">400</output>
             </div>
-            <input id="car-count" type="range" min="0" max="2000" step="50" value="400" disabled />
-            <div class="range-scale"><span>0</span><span>2000</span></div>
+            <input id="car-count" type="range" min="0" max="3000" step="50" value="400" disabled />
+            <div class="range-scale"><span>0</span><span>3000</span></div>
           </div>
 
           <div class="control-group">
@@ -67,12 +101,12 @@
               id="pedestrian-count"
               type="range"
               min="0"
-              max="3000"
+              max="4000"
               step="50"
               value="600"
               disabled
             />
-            <div class="range-scale"><span>0</span><span>3000</span></div>
+            <div class="range-scale"><span>0</span><span>4000</span></div>
           </div>
 
           <div class="control-group select-group">
@@ -97,6 +131,18 @@
               <input id="pedestrian-individual-colors" type="checkbox" role="switch" />
             </label>
             <p>Kikapcsolva minden autó narancs, minden gyalogos kék.</p>
+          </fieldset>
+
+          <fieldset class="traffic-heatmap-controls">
+            <legend>Forgalmi réteg</legend>
+            <label class="traffic-heatmap-toggle" for="traffic-heatmap">
+              <span>Útszakasz-terheltség hőtérkép</span>
+              <input id="traffic-heatmap" type="checkbox" role="switch" />
+            </label>
+            <p>Az utolsó 60 szimulált másodperc átlagsebessége a sebességhatárhoz képest.</p>
+            <div class="traffic-heatmap-scale" aria-hidden="true">
+              <span>Szabad</span><i></i><span>Terhelt</span>
+            </div>
           </fieldset>
 
           <div class="button-row">
@@ -207,6 +253,7 @@
           <span><i class="legend-road-pedestrian"></i> Csak gyalogos</span>
           <span><i class="legend-road-mixed"></i> Vegyes út</span>
           <span><i class="legend-poi"></i> Helyszín</span>
+          <span id="legend-traffic-heatmap" hidden><i class="legend-traffic-heatmap"></i> Terheltség</span>
         </div>
 
         <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>

@@ -8,6 +8,7 @@ class FakeElement {
     this.value = "0";
     this.textContent = "";
     this.listeners = new Map();
+    this.attributes = new Map();
     this.classList = { add() {}, remove() {}, toggle() {} };
     this.style = { setProperty() {} };
   }
@@ -22,7 +23,8 @@ class FakeElement {
 
   replaceChildren() {}
   append() {}
-  setAttribute() {}
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
 }
 
 const elements = new Map();
@@ -42,10 +44,20 @@ const fakeDocument = {
 globalThis.document = fakeDocument;
 globalThis.window = globalThis;
 const storageWrites = [];
+const storageValues = new Map([
+  [
+    "ujbuda-traffic-agent-color-modes-v1",
+    JSON.stringify({ car: "individual", pedestrian: "uniform" }),
+  ],
+  [
+    "ujbuda-traffic-map-render-options-v1",
+    JSON.stringify({ prepareAllLayers: true, renderFullMap: false }),
+  ],
+]);
 globalThis.localStorage = {
   getItem(key) {
-    assert.equal(key, "ujbuda-traffic-agent-color-modes-v1");
-    return JSON.stringify({ car: "individual", pedestrian: "uniform" });
+    assert.equal(storageValues.has(key), true);
+    return storageValues.get(key);
   },
   setItem(key, value) {
     storageWrites.push({ key, value });
@@ -84,7 +96,7 @@ const startupPattern = /\nupdateReplayUi\(\);\ninitializeApplication\(\);\s*$/;
 assert.match(appSource, startupPattern);
 appSource = appSource.replace(
   startupPattern,
-  "\nexport const replayAppTest = { state, consumeSimulationState, presentReplaySequence, returnToLive, toggleReplayPlayback, selectedSimulationStatePath, inspectFeature, loadAgentColorModes, persistAgentColorModes };\n",
+  "\nexport const replayAppTest = { state, consumeSimulationState, presentReplaySequence, returnToLive, toggleReplayPlayback, selectedSimulationStatePath, inspectFeature, loadAgentColorModes, persistAgentColorModes, loadMapRenderOptions, persistMapRenderOptions, setMapRenderOption, handleStaticPreparationChange, handleViewportInteractionChange, pollSimulation };\n",
 );
 
 const appModule = await import(
@@ -94,11 +106,14 @@ const app = appModule.replayAppTest;
 const mapCalls = [];
 const freezeCalls = [];
 const colorModeCalls = [];
+const staticRenderOptionCalls = [];
 app.state.localMap = {
   setAgents(agents, options) { mapCalls.push({ agents, options }); },
   freezeAgentTransition(timestamp) { freezeCalls.push(timestamp); },
   setAgentColorModes(modes) { colorModeCalls.push({ ...modes }); },
+  setStaticRenderOptions(options) { staticRenderOptionCalls.push({ ...options }); },
   setSelectedAgentRoute() { return true; },
+  isViewportInteracting() { return false; },
 };
 
 assert.deepEqual(app.state.agentColorModes, {
@@ -123,6 +138,66 @@ assert.deepEqual(colorModeCalls.at(-1), {
   pedestrian: "individual",
 });
 
+assert.deepEqual(app.state.mapRenderOptions, {
+  prepareAllLayers: true,
+  renderFullMap: false,
+});
+assert.equal(elements.get("#prepare-all-map-layers").checked, true);
+assert.equal(elements.get("#render-full-map").checked, false);
+const renderStatus = elements.get("#map-render-status");
+assert.match(renderStatus.textContent, /térkép betöltésekor indul/);
+assert.equal(renderStatus.getAttribute("aria-busy"), "false");
+
+const fullMapToggle = elements.get("#render-full-map");
+fullMapToggle.checked = true;
+fullMapToggle.listeners.get("change")({ currentTarget: fullMapToggle });
+assert.deepEqual(staticRenderOptionCalls.at(-1), {
+  prepareAllLayers: true,
+  renderFullMap: true,
+});
+assert.equal(storageWrites.at(-1).key, "ujbuda-traffic-map-render-options-v1");
+assert.deepEqual(JSON.parse(storageWrites.at(-1).value), staticRenderOptionCalls.at(-1));
+assert.equal(renderStatus.getAttribute("aria-busy"), "true");
+assert.match(renderStatus.textContent, /előkészítő indítása/);
+
+app.handleStaticPreparationChange({ phase: "preparing", completed: 2, total: 6 });
+assert.equal(renderStatus.textContent, "Térképrétegek előkészítése: 2/6…");
+assert.equal(renderStatus.getAttribute("aria-busy"), "true");
+app.handleStaticPreparationChange({ phase: "ready" });
+assert.equal(
+  renderStatus.textContent,
+  "Minden részletességi szint és a teljes kerület előkészítve.",
+);
+assert.equal(renderStatus.getAttribute("aria-busy"), "false");
+app.handleStaticPreparationChange({ phase: "limited" });
+assert.match(renderStatus.textContent, /biztonságos memóriahatár/);
+assert.equal(renderStatus.getAttribute("aria-busy"), "false");
+app.handleStaticPreparationChange({ phase: "fallback" });
+assert.match(renderStatus.textContent, /takarékos mód maradt aktív/);
+assert.equal(renderStatus.getAttribute("aria-busy"), "false");
+
+const prepareAllToggle = elements.get("#prepare-all-map-layers");
+prepareAllToggle.checked = false;
+prepareAllToggle.listeners.get("change")({ currentTarget: prepareAllToggle });
+assert.deepEqual(staticRenderOptionCalls.at(-1), {
+  prepareAllLayers: false,
+  renderFullMap: true,
+});
+app.handleStaticPreparationChange({ phase: "ready" });
+assert.equal(renderStatus.textContent, "A teljes kerület előkészítve.");
+fullMapToggle.checked = false;
+fullMapToggle.listeners.get("change")({ currentTarget: fullMapToggle });
+assert.deepEqual(staticRenderOptionCalls.at(-1), {
+  prepareAllLayers: false,
+  renderFullMap: false,
+});
+assert.match(renderStatus.textContent, /Takarékos mód/);
+assert.equal(renderStatus.getAttribute("aria-busy"), "false");
+const staticCallsBeforeInvalidOption = staticRenderOptionCalls.length;
+assert.equal(app.setMapRenderOption("renderFullMap", false), false);
+assert.equal(app.setMapRenderOption("unknown", true), false);
+assert.equal(staticRenderOptionCalls.length, staticCallsBeforeInvalidOption);
+
 const workingStorage = globalThis.localStorage;
 globalThis.localStorage = {
   getItem() { return "{"; },
@@ -132,6 +207,10 @@ assert.deepEqual(app.loadAgentColorModes(), {
   car: "uniform",
   pedestrian: "uniform",
 });
+assert.deepEqual(app.loadMapRenderOptions(), {
+  prepareAllLayers: false,
+  renderFullMap: false,
+});
 globalThis.localStorage = {
   getItem() { throw new Error("SecurityError"); },
   setItem() { throw new Error("QuotaExceededError"); },
@@ -140,7 +219,12 @@ assert.deepEqual(app.loadAgentColorModes(), {
   car: "uniform",
   pedestrian: "uniform",
 });
+assert.deepEqual(app.loadMapRenderOptions(), {
+  prepareAllLayers: false,
+  renderFullMap: false,
+});
 assert.doesNotThrow(() => app.persistAgentColorModes({ car: "individual" }));
+assert.doesNotThrow(() => app.persistMapRenderOptions({ prepareAllLayers: true }));
 globalThis.localStorage = workingStorage;
 
 const firstPayload = {
@@ -297,6 +381,95 @@ try {
   globalThis.setTimeout = nativeSetTimeout;
   globalThis.clearTimeout = nativeClearTimeout;
   Object.defineProperty(globalThis, "performance", nativePerformanceDescriptor);
+}
+
+const configuredBeforeInteractionTest = app.state.configured;
+app.state.configured = false;
+app.state.viewportInteracting = false;
+const interactionTimer = globalThis.setTimeout(() => {}, 60_000);
+app.state.pollTimer = interactionTimer;
+app.handleViewportInteractionChange(true);
+assert.equal(app.state.viewportInteracting, true);
+assert.equal(app.state.pollTimer, interactionTimer);
+app.handleViewportInteractionChange(false);
+assert.equal(app.state.viewportInteracting, false);
+assert.equal(app.state.pollTimer, interactionTimer);
+globalThis.clearTimeout(interactionTimer);
+app.state.pollTimer = null;
+app.state.configured = configuredBeforeInteractionTest;
+
+const nativePollSetTimeout = globalThis.setTimeout;
+const nativePollClearTimeout = globalThis.clearTimeout;
+const nativePollFetch = globalThis.fetch;
+const viewportPollTimers = [];
+let viewportFetchCount = 0;
+try {
+  globalThis.setTimeout = (callback, delay) => {
+    const timer = { callback, delay, cleared: false };
+    viewportPollTimers.push(timer);
+    return timer;
+  };
+  globalThis.clearTimeout = (timer) => {
+    if (timer) {
+      timer.cleared = true;
+    }
+  };
+  const gesturePayload = {
+    ...firstPayload,
+    agents: [{ ...firstPayload.agents[0], lat: 47.4705, speedKph: 42 }],
+    stats: { ...firstPayload.stats, elapsedSeconds: 31 },
+  };
+  globalThis.fetch = async () => {
+    viewportFetchCount += 1;
+    return {
+      ok: true,
+      status: 200,
+      json: async () => gesturePayload,
+    };
+  };
+  app.state.pollTimer = null;
+  app.state.polling = false;
+  app.state.controlPending = false;
+  app.state.configured = true;
+  app.state.viewportInteracting = true;
+  app.state.viewportUiDirty = false;
+  app.state.pollAgain = false;
+  app.state.replayMode = "live";
+  app.state.selectedFeature = { type: "agent", agent: firstPayload.agents[0] };
+  app.state.replayBuffer = replayModule.createReplayBuffer();
+  app.state.replayMetadata.clear();
+  const callsBeforeViewportPoll = mapCalls.length;
+  const clockBeforeViewportPoll = elements.get("#clock-chip").textContent;
+  elements.get("#inspector-details").textContent = "gesture-before";
+  await app.pollSimulation();
+  assert.equal(viewportFetchCount, 1);
+  assert.equal(mapCalls.length, callsBeforeViewportPoll + 1);
+  assert.equal(mapCalls.at(-1).agents[0].lat, 47.4705);
+  assert.equal(app.state.latestLivePayload.agents[0].lat, 47.4705);
+  assert.equal(app.state.selectedFeature.agent.speedKph, 42);
+  assert.equal(app.state.replayBuffer.length, 1);
+  assert.equal(app.state.viewportUiDirty, true);
+  assert.equal(elements.get("#clock-chip").textContent, clockBeforeViewportPoll);
+  assert.equal(elements.get("#inspector-details").textContent, "gesture-before");
+  assert.equal(app.state.pollAgain, false);
+  assert.equal(app.state.polling, false);
+  assert.equal(viewportPollTimers.some((timer) => timer.delay === 8_000 && timer.cleared), true);
+  assert.equal(viewportPollTimers.some((timer) => timer.delay === 125 && !timer.cleared), true);
+
+  app.handleViewportInteractionChange(false);
+  assert.equal(app.state.viewportInteracting, false);
+  assert.equal(app.state.viewportUiDirty, false);
+  assert.notEqual(elements.get("#clock-chip").textContent, clockBeforeViewportPoll);
+  assert.notEqual(elements.get("#inspector-details").textContent, "gesture-before");
+} finally {
+  globalThis.setTimeout = nativePollSetTimeout;
+  globalThis.clearTimeout = nativePollClearTimeout;
+  globalThis.fetch = nativePollFetch;
+  app.state.pollTimer = null;
+  app.state.viewportInteracting = false;
+  app.state.viewportUiDirty = false;
+  app.state.selectedFeature = null;
+  app.state.configured = configuredBeforeInteractionTest;
 }
 
 console.log("replay app live/history/background-poll contract: OK");

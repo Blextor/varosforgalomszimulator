@@ -146,6 +146,38 @@ class ServerErrorHandlingTests(unittest.TestCase):
             self.assertIn("javascript", response.getheader("Content-Type"))
             self.assertIn("REPLAY_WINDOW_MS = 60_000", content)
 
+    def test_segment_statistics_endpoint_keeps_metrics_out_of_state_stream(self) -> None:
+        payload = {
+            "configured": True,
+            "windowSeconds": 60.0,
+            "elapsedSeconds": 12.5,
+            "segments": {"segment-a": [7, 2, 31.4, 0.63, 37.0, 18.0]},
+        }
+        with patch.object(
+            RUNTIME, "segment_statistics", return_value=payload
+        ) as statistics:
+            with urlopen(
+                f"{self.base_url}/api/simulation/segments?includeSegmentId=segment-a",
+                timeout=5,
+            ) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read().decode("utf-8")), payload)
+        statistics.assert_called_once_with(
+            segment_id=None,
+            include_segment_id="segment-a",
+        )
+
+    def test_segment_statistics_endpoint_rejects_ambiguous_query(self) -> None:
+        with patch.object(RUNTIME, "segment_statistics") as statistics:
+            with self.assertRaises(HTTPError) as captured:
+                urlopen(
+                    f"{self.base_url}/api/simulation/segments?segmentId=a&includeSegmentId=b",
+                    timeout=5,
+                )
+            self.assertEqual(captured.exception.code, 400)
+            captured.exception.read()
+        statistics.assert_not_called()
+
     def test_reset_control_response_identifies_the_new_simulation_epoch(self) -> None:
         class FakeSimulation:
             reset_calls = 0

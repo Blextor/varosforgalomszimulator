@@ -523,6 +523,28 @@ class SimulationRuntime:
                 **simulation_snapshot,
             }
 
+    def segment_statistics(
+        self,
+        *,
+        segment_id: str | None = None,
+        include_segment_id: str | None = None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            if self.simulation is None:
+                return {
+                    "configured": False,
+                    "windowSeconds": 60.0,
+                    "elapsedSeconds": 0.0,
+                    "segments": {},
+                }
+            return {
+                "configured": True,
+                **self.simulation.segment_statistics(
+                    segment_id=segment_id,
+                    include_segment_id=include_segment_id,
+                ),
+            }
+
     @staticmethod
     def _compact_internal_agent(
         record: tuple[int, ...],
@@ -787,6 +809,31 @@ class ApplicationHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/network":
             self._send_network()
+            return
+        if path == "/api/simulation/segments":
+            try:
+                query = parse_qs(parsed_url.query, keep_blank_values=True)
+                segment_values = query.get("segmentId", [])
+                include_values = query.get("includeSegmentId", [])
+                if len(segment_values) > 1 or len(include_values) > 1:
+                    raise ValueError("Az útszakasz-azonosító ismétlődik.")
+                if segment_values and include_values:
+                    raise ValueError(
+                        "A célzott és a hőtérképes útszakasz-paraméter nem kombinálható."
+                    )
+                segment_id = segment_values[0] if segment_values else None
+                include_segment_id = include_values[0] if include_values else None
+                for value in (segment_id, include_segment_id):
+                    if value is not None and (not value or len(value) > 160):
+                        raise ValueError("Az útszakasz-azonosító érvénytelen.")
+                self._send_json(
+                    RUNTIME.segment_statistics(
+                        segment_id=segment_id,
+                        include_segment_id=include_segment_id,
+                    )
+                )
+            except ValueError as error:
+                self._send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
             return
         if path == "/api/simulation/state":
             try:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from random import Random
 
 from traffic_simulator.network_simulation import (
@@ -9,6 +10,7 @@ from traffic_simulator.network_simulation import (
     NetworkPOI,
     NetworkTrafficSimulation,
     RoadNetwork,
+    SnappedPOI,
 )
 
 
@@ -64,6 +66,10 @@ def vehicle_behavior_network_fixture() -> dict:
             {"id": 9, "lat": 47.4695, "lng": 19.0350},
             {"id": 10, "lat": 47.4695, "lng": 19.0360},
             {"id": 11, "lat": 47.4695, "lng": 19.0370},
+            {"id": 12, "lat": 47.4695, "lng": 19.0380},
+            {"id": 13, "lat": 47.4695, "lng": 19.0390},
+            {"id": 14, "lat": 47.4695, "lng": 19.0400},
+            {"id": 15, "lat": 47.4700, "lng": 19.0400},
         ],
         "segments": [],
         "edges": [
@@ -91,6 +97,32 @@ def vehicle_behavior_network_fixture() -> dict:
             _edge("left-return", 21, 4, 1, lanes=2),
             _edge("right", 30, 2, 5, lanes=2),
             _edge("right-return", 31, 5, 1, lanes=2),
+            _edge(
+                "rank-source",
+                70,
+                11,
+                12,
+                lanes=3,
+                turn_lanes=[["left"], ["through"], ["through"]],
+            ),
+            _edge(
+                "rank-target",
+                71,
+                12,
+                13,
+                lanes=2,
+                length_meters=3.0,
+            ),
+            _edge(
+                "rank-short",
+                71,
+                13,
+                14,
+                lanes=2,
+                length_meters=3.0,
+            ),
+            _edge("rank-exit", 71, 14, 15, lanes=2),
+            _edge("rank-return", 72, 15, 1, lanes=2),
         ],
         "restrictions": [],
         "pois": [],
@@ -281,6 +313,42 @@ class NaturalLaneBehaviorRegressionTests(unittest.TestCase):
         self.assertIsNone(car.planned_edge_id)
         self.assertEqual(car.lane_index, 2)
 
+    def test_lane_reduction_preserves_both_compatible_lane_streams(self) -> None:
+        source = self.network.edges_by_id["rank-source"]
+        target = self.network.edges_by_id["rank-target"]
+        cars = [
+            make_car(
+                agent_id,
+                source,
+                distance_meters=source.length_meters,
+                lane_index=lane_index,
+                planned_edge_id=target.id,
+                route_edge_ids=(source.id, target.id, "rank-short"),
+            )
+            for agent_id, lane_index in ((40, 1), (41, 2))
+        ]
+        occupancy = {("car", source.id): 2}
+        lane_positions = {
+            (source.id, car.lane_index): {car.id: car.distance_meters}
+            for car in cars
+        }
+
+        for car in cars:
+            self.assertTrue(
+                self.simulation._enter_next_edge(
+                    car,
+                    occupancy,
+                    lane_positions,
+                    {},
+                )
+            )
+
+        self.assertEqual([car.lane_index for car in cars], [0, 1])
+        self.assertEqual(
+            {key for key in lane_positions if key[0] == target.id},
+            {(target.id, 0), (target.id, 1)},
+        )
+
 
 class VehicleFollowingRegressionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -453,6 +521,421 @@ class VehicleFollowingRegressionTests(unittest.TestCase):
             )
         self.assertGreaterEqual(route_gap, CAR_LENGTH_METERS - 1e-6)
 
+    def test_short_edge_chain_keeps_route_headway_across_edge_boundaries(self) -> None:
+        simulation = self.new_simulation()
+        source = self.network.edges_by_id["rank-source"]
+        target = self.network.edges_by_id["rank-target"]
+        short_edge = self.network.edges_by_id["rank-short"]
+        leader = make_car(
+            40,
+            short_edge,
+            distance_meters=1.0,
+            lane_index=0,
+            desired_speed_mps=0.0,
+            planned_edge_id="rank-exit",
+            route_edge_ids=(short_edge.id, "rank-exit"),
+        )
+        follower = make_car(
+            41,
+            source,
+            distance_meters=source.length_meters - 4.0,
+            lane_index=1,
+            desired_speed_mps=30.0,
+            planned_edge_id=target.id,
+            route_edge_ids=(source.id, target.id, short_edge.id, "rank-exit"),
+        )
+        simulation.agents = [follower, leader]
+
+        simulation.step(1.0)
+
+        route_gap = (
+            source.length_meters
+            - follower.distance_meters
+            + target.length_meters
+            + leader.distance_meters
+        )
+        self.assertIs(follower.edge, source)
+        self.assertGreaterEqual(route_gap, CAR_LENGTH_METERS - 1e-6)
+
+    def test_large_step_route_less_chain_keeps_cross_edge_headway(self) -> None:
+        simulation = self.new_simulation()
+        source = self.network.edges_by_id["rank-source"]
+        target = self.network.edges_by_id["rank-target"]
+        short_edge = self.network.edges_by_id["rank-short"]
+        leader = make_car(
+            42,
+            short_edge,
+            distance_meters=1.0,
+            lane_index=0,
+            desired_speed_mps=0.0,
+            planned_edge_id="rank-exit",
+        )
+        follower = make_car(
+            43,
+            source,
+            distance_meters=source.length_meters - 10.0,
+            lane_index=1,
+            desired_speed_mps=30.0,
+            planned_edge_id=target.id,
+        )
+        simulation.agents = [follower, leader]
+
+        simulation.step(1.0)
+
+        route_gap = (
+            source.length_meters
+            - follower.distance_meters
+            + target.length_meters
+            + leader.distance_meters
+        )
+        self.assertIs(follower.edge, source)
+        self.assertGreaterEqual(route_gap, CAR_LENGTH_METERS - 1e-6)
+
+    def test_multi_edge_merge_limit_survives_intermediate_transition(self) -> None:
+        payload = {
+            "meta": {
+                "bounds": {
+                    "south": 47.0,
+                    "west": 19.0,
+                    "north": 47.01,
+                    "east": 19.01,
+                }
+            },
+            "nodes": [
+                {"id": 1, "lat": 47.0, "lng": 19.0},
+                {"id": 2, "lat": 47.0, "lng": 19.001},
+                {"id": 3, "lat": 47.001, "lng": 19.0},
+                {"id": 5, "lat": 47.0005, "lng": 19.002},
+                {"id": 6, "lat": 47.0005, "lng": 19.003},
+            ],
+            "segments": [],
+            "edges": [
+                _edge("fcur", 1, 1, 2, length_meters=2.0),
+                _edge("fconn", 2, 2, 5, length_meters=8.5),
+                _edge("lcur", 3, 3, 5, length_meters=0.5),
+                _edge("target", 4, 5, 6, length_meters=100.0),
+            ],
+            "restrictions": [],
+            "pois": [],
+        }
+        network = RoadNetwork(payload)
+        simulation = NetworkTrafficSimulation(
+            network, cars=0, pedestrians=0, seed=42
+        )
+        follower = make_car(
+            1,
+            network.edges_by_id["fcur"],
+            distance_meters=0.0,
+            desired_speed_mps=10.0,
+            planned_edge_id="fconn",
+            route_edge_ids=("fcur", "fconn", "target"),
+        )
+        leader = make_car(
+            2,
+            network.edges_by_id["lcur"],
+            distance_meters=0.0,
+            desired_speed_mps=1.0,
+            planned_edge_id="target",
+            route_edge_ids=("lcur", "target"),
+        )
+        simulation.agents = [follower, leader]
+
+        following_limits, _ = simulation._car_following_context(0.5)
+        simulation.step(0.5)
+
+        self.assertEqual(following_limits[follower.id], ("fconn", 0, 0.5))
+        self.assertEqual(follower.edge.id, "fconn")
+        self.assertEqual(leader.edge.id, "target")
+        route_gap = (
+            network.edges_by_id["fconn"].length_meters
+            - follower.distance_meters
+            + leader.distance_meters
+        )
+        self.assertGreaterEqual(route_gap, CAR_LENGTH_METERS - 1e-6)
+
+    def test_reseed_cannot_take_a_future_slot_inside_the_step_horizon(self) -> None:
+        payload = {
+            "meta": {
+                "bounds": {
+                    "south": 47.0,
+                    "west": 19.0,
+                    "north": 47.01,
+                    "east": 19.01,
+                }
+            },
+            "nodes": [
+                {"id": 1, "lat": 47.0, "lng": 19.0},
+                {"id": 2, "lat": 47.0, "lng": 19.001},
+                {"id": 3, "lat": 47.001, "lng": 19.0},
+                {"id": 5, "lat": 47.0005, "lng": 19.002},
+                {"id": 6, "lat": 47.0005, "lng": 19.003},
+            ],
+            "segments": [],
+            "edges": [
+                _edge("fcur", 1, 1, 2, length_meters=2.0),
+                _edge("fconn", 2, 2, 5, length_meters=8.5),
+                _edge("lcur", 3, 3, 5, length_meters=0.5),
+                _edge("target", 4, 5, 6, length_meters=100.0),
+            ],
+            "restrictions": [],
+            "pois": [],
+        }
+        network = RoadNetwork(payload)
+        simulation = NetworkTrafficSimulation(
+            network, cars=0, pedestrians=0, seed=42
+        )
+        follower = make_car(
+            1,
+            network.edges_by_id["fcur"],
+            distance_meters=0.0,
+            desired_speed_mps=10.0,
+            planned_edge_id="fconn",
+            route_edge_ids=("fcur", "fconn", "target"),
+        )
+        relocating_car = make_car(
+            2,
+            network.edges_by_id["lcur"],
+            distance_meters=0.0,
+            desired_speed_mps=1.0,
+            route_edge_ids=("lcur",),
+        )
+        simulation.agents = [follower, relocating_car]
+        following_limits, lane_positions = (
+            simulation._car_following_context(0.5)
+        )
+        origin = SnappedPOI(self.missing_destination(), node_id=1)
+        destination = SnappedPOI(self.missing_destination(), node_id=6)
+        simulation._initial_poi_route = lambda *args, **kwargs: (
+            origin,
+            destination,
+            ("target",),
+        )
+        occupancy = {
+            ("car", follower.edge.id): 1,
+            ("car", relocating_car.edge.id): 1,
+        }
+
+        relocated = simulation._restart_agent_trip(
+            relocating_car,
+            prefer_gateway=False,
+            occupancy=occupancy,
+            lane_positions=lane_positions,
+            following_limits=following_limits,
+        )
+
+        self.assertFalse(relocated)
+        self.assertEqual(relocating_car.edge.id, "lcur")
+        self.assertEqual(relocating_car.relocation_generation, 0)
+
+    def test_reseed_cannot_take_a_linear_upstream_slot(self) -> None:
+        simulation = self.new_simulation()
+        source = self.network.edges_by_id["transition-source"]
+        target = self.network.edges_by_id["transition-target"]
+        exit_edge = self.network.edges_by_id["transition-exit"]
+        approach = self.network.edges_by_id["approach"]
+        upstream_car = make_car(
+            1,
+            source,
+            distance_meters=source.length_meters - 1.0,
+            desired_speed_mps=10.0,
+            planned_edge_id=target.id,
+            route_edge_ids=(source.id, target.id, exit_edge.id),
+        )
+        relocating_car = make_car(
+            2,
+            approach,
+            distance_meters=10.0,
+            desired_speed_mps=1.0,
+            route_edge_ids=(approach.id,),
+        )
+        simulation.agents = [upstream_car, relocating_car]
+
+        following_limits, lane_positions = (
+            simulation._car_following_context(0.5)
+        )
+        origin = SnappedPOI(self.missing_destination(), node_id=target.from_node)
+        destination = SnappedPOI(
+            self.missing_destination(), node_id=exit_edge.to_node
+        )
+        simulation._initial_poi_route = lambda *args, **kwargs: (
+            origin,
+            destination,
+            (target.id, exit_edge.id),
+        )
+        occupancy = {
+            ("car", source.id): 1,
+            ("car", approach.id): 1,
+        }
+
+        self.assertNotIn(target.id, simulation._merge_candidate_edge_ids)
+        self.assertIn((target.id, 0), simulation._active_merge_approaches)
+        relocated = simulation._restart_agent_trip(
+            relocating_car,
+            prefer_gateway=False,
+            occupancy=occupancy,
+            lane_positions=lane_positions,
+            following_limits=following_limits,
+        )
+
+        self.assertFalse(relocated)
+        self.assertIs(relocating_car.edge, approach)
+        self.assertEqual(relocating_car.relocation_generation, 0)
+
+    def test_red_signal_never_rewinds_a_car_past_the_stop_line(self) -> None:
+        simulation = self.new_simulation()
+        approach = self.network.edges_by_id["approach"]
+        car = make_car(
+            44,
+            approach,
+            distance_meters=approach.length_meters - 0.1,
+            lane_index=1,
+            desired_speed_mps=30.0,
+            planned_edge_id="straight",
+            route_edge_ids=(approach.id, "straight"),
+        )
+        simulation.agents = [car]
+        simulation.elapsed_seconds = 50.0
+        previous_distance = car.distance_meters
+
+        simulation.step(0.1)
+
+        self.assertGreaterEqual(car.distance_meters, previous_distance)
+        self.assertGreater(car.wait_seconds, 0.0)
+
+    def test_blocked_poi_departure_uses_marked_safe_relocation(self) -> None:
+        simulation = self.new_simulation()
+        source = self.network.edges_by_id["rank-source"]
+        target = self.network.edges_by_id["rank-target"]
+        short_edge = self.network.edges_by_id["rank-short"]
+        safe_edge = self.network.edges_by_id["straight"]
+        car = make_car(
+            45,
+            source,
+            distance_meters=source.length_meters,
+            lane_index=1,
+            route_edge_ids=(source.id,),
+        )
+        leaders = [
+            make_car(
+                46 + lane_index,
+                short_edge,
+                distance_meters=1.0,
+                lane_index=lane_index,
+            )
+            for lane_index in range(2)
+        ]
+        gateway_origin, next_destination = (
+            simulation.route_pois_by_mode["car"][:2]
+        )
+        origin = replace(gateway_origin, gateway=False)
+        simulation.route_pois_by_id["car"][origin.poi.id] = origin
+        car.destination_poi = origin.poi
+        simulation.agents = [car, *leaders]
+        simulation._choose_poi_route = lambda *args, **kwargs: (
+            next_destination,
+            (target.id, short_edge.id, "rank-exit"),
+        )
+        simulation._initial_poi_route = lambda *args, **kwargs: (
+            origin,
+            next_destination,
+            (safe_edge.id, "straight-next", "narrow"),
+        )
+        occupancy = {
+            ("car", source.id): 1,
+            ("car", short_edge.id): 2,
+        }
+        lane_positions = {
+            (source.id, car.lane_index): {car.id: car.distance_meters},
+            **{
+                (short_edge.id, leader.lane_index): {
+                    leader.id: leader.distance_meters
+                }
+                for leader in leaders
+            },
+        }
+
+        completed = simulation._complete_poi_trip(
+            car, occupancy, lane_positions, {}
+        )
+
+        self.assertTrue(completed)
+        self.assertIs(car.edge, safe_edge)
+        self.assertEqual(car.distance_meters, 0.0)
+        self.assertEqual(car.relocation_generation, 1)
+        self.assertNotIn((source.id, 1), lane_positions)
+
+    def test_initial_population_reserves_headway_on_the_next_short_edge(self) -> None:
+        simulation = self.new_simulation()
+        source = self.network.edges_by_id["rank-source"]
+        target = self.network.edges_by_id["rank-target"]
+        follower = make_car(
+            50,
+            source,
+            distance_meters=source.length_meters,
+            lane_index=1,
+            planned_edge_id=target.id,
+            route_edge_ids=(source.id, target.id, "rank-short"),
+        )
+        overlapping_candidate = make_car(
+            51,
+            target,
+            distance_meters=1.0,
+            lane_index=0,
+            planned_edge_id="rank-short",
+            route_edge_ids=(target.id, "rank-short", "rank-exit"),
+        )
+        simulation.agents = [follower]
+        simulation._create_agent = lambda mode: overlapping_candidate
+
+        simulation._reconcile("car", 2)
+
+        self.assertEqual(simulation.agents, [follower])
+
+    def test_free_flow_driver_ratio_survives_micro_edge_transitions(self) -> None:
+        simulation = self.new_simulation()
+        source = self.network.edges_by_id["rank-target"]
+        target = self.network.edges_by_id["rank-short"]
+        ratio = 0.87
+        car = make_car(
+            60,
+            source,
+            distance_meters=source.length_meters,
+            lane_index=0,
+            desired_speed_mps=(source.max_speed_kph / 3.6) * ratio,
+            planned_edge_id=target.id,
+            route_edge_ids=(source.id, target.id, "rank-exit"),
+        )
+        car.free_flow_speed_ratio = ratio
+
+        self.assertTrue(simulation._enter_next_edge(car))
+
+        self.assertAlmostEqual(car.free_flow_speed_ratio, ratio, places=12)
+        self.assertAlmostEqual(
+            car.desired_speed_mps,
+            (target.max_speed_kph / 3.6) * ratio,
+            places=12,
+        )
+
+    def test_micro_edge_density_uses_a_route_window_instead_of_one_edge(self) -> None:
+        simulation = self.new_simulation()
+        edge = self.network.edges_by_id["rank-target"]
+        car = make_car(
+            70,
+            edge,
+            distance_meters=1.0,
+            lane_index=0,
+            desired_speed_mps=10.0,
+            planned_edge_id="rank-short",
+            route_edge_ids=(edge.id, "rank-short", "rank-exit"),
+        )
+        occupancy = {("car", edge.id): 1}
+
+        density = simulation._car_density_window(car, occupancy, {})
+        speed = simulation._effective_speed(car, occupancy, {})
+
+        self.assertLess(density, 0.1)
+        self.assertGreater(speed, car.desired_speed_mps * 0.95)
+
     def test_initial_car_population_has_lane_spacing(self) -> None:
         simulation = NetworkTrafficSimulation(
             self.network,
@@ -490,7 +973,7 @@ class VehicleFollowingRegressionTests(unittest.TestCase):
 
         self.assertEqual(simulation.agents, [existing])
 
-    def test_poi_fallback_moves_the_existing_lane_registry_entry(self) -> None:
+    def test_poi_fallback_keeps_a_one_tick_departure_reservation(self) -> None:
         simulation = self.new_simulation()
         approach = self.network.edges_by_id["approach"]
         car = make_car(
@@ -517,7 +1000,10 @@ class VehicleFollowingRegressionTests(unittest.TestCase):
 
         self.assertTrue(entered)
         self.assertEqual(car.edge.id, "straight")
-        self.assertNotIn(("approach", 2), lane_positions)
+        self.assertEqual(
+            lane_positions[("approach", 2)][car.id],
+            approach.length_meters,
+        )
         self.assertEqual(
             lane_positions[(car.edge.id, car.lane_index)][car.id],
             0.0,

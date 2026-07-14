@@ -801,6 +801,36 @@ class NetworkSimulationTests(unittest.TestCase):
         self.assertGreater(stats["averageCarSpeedKph"], 0)
         self.assertEqual(len(simulation.snapshot()["agents"]), 50)
 
+    def test_segment_statistics_track_recent_car_flow_and_reset(self) -> None:
+        simulation = NetworkTrafficSimulation(
+            poi_routing_fixture(), cars=1, pedestrians=0, seed=17
+        )
+        for _ in range(20):
+            simulation.step(0.5)
+
+        payload = simulation.segment_statistics()
+        self.assertEqual(payload["windowSeconds"], 60.0)
+        self.assertTrue(payload["segments"])
+        self.assertGreater(
+            sum(record[0] for record in payload["segments"].values()),
+            0,
+        )
+        self.assertTrue(
+            any(record[5] > 0 for record in payload["segments"].values())
+        )
+        for record in payload["segments"].values():
+            self.assertGreaterEqual(record[4], 0)
+            self.assertLessEqual(record[4], 100)
+
+        segment_id = next(iter(payload["segments"]))
+        detail = simulation.segment_statistics(segment_id=segment_id)
+        self.assertEqual(set(detail["segments"]), {segment_id})
+
+        simulation.reset()
+        reset_detail = simulation.segment_statistics(segment_id=segment_id)
+        self.assertEqual(reset_detail["segments"][segment_id][0], 0)
+        self.assertEqual(reset_detail["segments"][segment_id][5], 0)
+
     def test_population_resize_and_reset(self) -> None:
         simulation = NetworkTrafficSimulation(
             network_fixture(), cars=5, pedestrians=8, seed=5

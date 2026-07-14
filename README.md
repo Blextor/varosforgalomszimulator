@@ -102,28 +102,38 @@ A sávadat OSM-lefedettsége nem teljes. A hiányzó sávszámot a fordító kon
 - egérgörgő: nagyítás;
 - húzás: térkép mozgatása;
 - dupla kattintás: teljes XI. kerületre igazítás;
-- útszakaszra kattintás: név, sávszám, sebesség és kanyarodási sávok;
+- útszakaszra kattintás: név, sávszám, sebesség, kanyarodási sávok, az összes
+  áthaladt autó és az utolsó 60 szimulált másodperc átlagsebessége/terheltsége;
 - POI-jelölőre kattintás: név, kategória és fontos OSM-címkék;
 - autóra vagy gyalogosra kattintás: a hátralévő A–B útvonal kiemelése (autó:
   narancs, gyalogos: szaggatott cián);
 - kategóriagombok: a megjelenített helyszíntípusok ki- és bekapcsolása;
 - a 02-es panel visszajátszó csúszkája: korábbi állapot megtekintése vagy 1× szimulációs időben történő lejátszása, majd visszatérés az élő nézethez;
 - a két ágensszín-kapcsoló: az autók és gyalogosok egymástól függetlenül válthatók stabil egyedi paletta, illetve egységes narancs/kék megjelenítés között;
+- „Útszakasz-terheltség hőtérkép”: az autózható szakaszokat zöld–sárga–piros
+  skálán színezi a sebességhatárhoz viszonyított gördülő átlagsebesség alapján,
+  az autókat pedig halványítja, hogy a hálózati terhelés maradjon hangsúlyos;
+- „Minden részletességi szint előkészítése”: a zoomszintek csempéit külön háttér-workerben előre elkészíti;
+- „Teljes kerület előrajzolása”: az aktuális részletességgel a képernyőn kívüli területet is elkészíti, fekete térképszéli margóval;
 - nagy nagyításnál: sávelválasztók és kanyarodási nyilak.
 
 A térképi jelmagyarázat külön mutatja az autózható, vegyes és csak gyalogos
 szakaszokat. A POI-jelölők fix, méteralapú világkoordináta-rácson kapnak
 zoomfüggő ritkítást. Azonos zoomszinten pásztázva ezért ugyanaz a POI marad
 egy cella nyertese, nem vibrál a képernyőpixelekhez igazodva.
+Maguk a POI-feliratok külön dinamikus Canvas-rétegen, fix 10 képpontos betűmérettel
+rajzolódnak újra, ezért nagyítás közben nem skálázódnak együtt a statikus bitmappel.
 
 A pásztázás és zoom alatt a böngésző nem építi újra képkockánként a több tízezer
-szegmensből álló `Path2D` hálózatot. A statikus, túlnyúló térképréteget és az
-ágensréteget egy közös CSS-mátrixszal a Chrome kompozitora mozgatja; a pontos
-vektoros újrarajzolás külön `OffscreenCanvas` workerben készül a húzás végén,
-illetve 180 ms wheel-nyugalom után. Aktív gesztus közben nem kerül köztes bitmap
-a látható canvasra: az alap- és ágensréteg ugyanazt a fagyasztott forrásképet és
-CSS-mátrixot használja, majd egyetlen pontos commitban vált vissza. Ha a böngésző
-nem támogatja ezt az utat, a korábbi
+szegmensből álló `Path2D` hálózatot. A statikus, túlnyúló térképréteg külön
+wrapperben marad, az ágenscanvas pedig fölötte önálló kompozitorréteg. A Chrome
+mindkettőhöz a saját utolsó forrásnézetéből számított CSS-mátrixot kapja. Közben
+az ágensütemező tovább rajzol az aktuális nézet koordinátáival, és minden új
+dinamikus képkockával ugyanabban a JavaScript-feladatban visszaállítja a saját
+mátrixát identityre. A pontos statikus kép külön `OffscreenCanvas` workerben
+készül a húzás végén, illetve 180 ms wheel-nyugalom után. Így a járművek és a
+gyalogosok a gesztus alatt is mozognak, miközben a drága úthálózat csak egyszer
+raszterizálódik újra. Ha a böngésző nem támogatja ezt az utat, a korábbi
 főszálas rajzolás marad biztonsági tartalék. A nem válaszoló háttérrenderelő
 2,5 másodperc után automatikusan leáll, így nem hagyhatja beragadt állapotban a
 térképet.
@@ -148,15 +158,31 @@ válasz kimarad, a verzió nem egyezik vagy a szerver újraindul, a következő 
 automatikusan teljes állapotot kap. A nagy JSON-válaszok `gzip` level 1
 tömörítést használnak, amennyiben a kliens ezt támogatja.
 
+Az útszakaszok gördülő mutatói külön `/api/simulation/segments` végponton érkeznek
+1–1,8 másodperces ritmusban, csak amikor a hőtérkép vagy egy szakasz-inspector
+igényli őket. Így ezek az adatok nem növelik meg a sűrűn lekért ágens-deltákat.
+
 Futás közben a kliens 3000 ágens alatt 125 ms-os, attól kezdve 200 ms-os,
 határidő-alapú ritmusban kér új állapotot; szünetben 750 ms-ra lassít. A kérés
 és a feldolgozás idejét levonja a következő várakozásból, és egyszerre legfeljebb
-egy kérés lehet folyamatban. A Canvas a mért csomagköz alapján interpolálja a
-pozíciót és az irányszöget, majd még a következő csomag előtt leállítja az
-`requestAnimationFrame` láncot. Új csomagnál a ténylegesen kirajzolt helyről
-folytatja a mozgást. Az ágenseket minden zoomon színenként kötegeli, de a vékony
-körvonalat egyetlen közös `Path2D`-menetben rajzolja meg. Legalább 3000 ágensnél
-az egyedi színű animáció 30 FPS-es korlátot kap kötelező pontos végállapot-frame-mel;
+egy kérés lehet folyamatban. Az élő, mozgó autóknál a Canvas a teljes mért
+csomagközt kitöltő, korlátozott Hermite-ívvel interpolálja a pozíciót, az
+irányszöget pedig az ív érintőjéből számítja. Várakozó vagy áthelyezett
+járműnél, gyalogosnál és replay közben lineáris, illetve statikus megjelenítést
+használ. Új csomagnál a ténylegesen kirajzolt helyről folytatja a mozgást.
+Aktív pásztázás vagy zoom alatt az állapotkérés, a full/delta dekódolás és a
+replay-rögzítés is a szokásos ritmusban folytatódik. A statisztika-, vezérlő- és
+inspector-DOM frissítéseit a kliens összegyűjti, majd
+a gesztus végén egyszer írja ki a legújabb állapotot. A commit nem nullázza az
+interpoláció előző pozícióit vagy időalapját, ezért felengedéskor sincs
+végállapotba ugrás. Az ágenseket minden zoomon színenként kötegeli, és egy szín
+geometriáját csak egyszer építi fel: ugyanazt
+a context-pathot tölti ki és körvonalazza, képkockánkénti natív `Path2D`-allokáció
+nélkül. Legalább 3000 ágensnél az egyedi színű animáció 1× backing pixelarányt kap,
+és csak 2500 alá csökkenve vált vissza, így a küszöb körül nem allokálja újra a
+canvast. Normál esetben továbbra is 60 Hz-en frissül, és csak
+8 ms fölé kerülő mért rajzolási költségnél vált adaptív 30 FPS-re; a pontos
+végállapot-frame mindkét esetben kötelező;
 csak a kijelölt ágens készül külön, hogy a kijelölési glória megmaradjon.
 
 Az útvonalkapu miatt új indulópontra helyezett ágenst a delta külön jelöli, így
@@ -170,8 +196,13 @@ játszódik le, függetlenül a rögzítéskori időgyorsítástól.
 Az autó megtartja a sávját, amíg az megfelel a következő manővernek; csak
 kanyarodási sáv vagy sávszűkülés kényszerít váltást. Ha a kompatibilis sáv
 következő rövid OSM-szakaszának belépője foglalt, az autó sorban marad ahelyett,
-hogy egy szabad szomszéd sávba, majd rögtön visszaugorna. Azonos irányított él
-és sáv autói között legalább 7,5 méteres modellbeli járműköz marad.
+hogy egy szabad szomszéd sávba, majd rögtön visszaugorna. A 3-ról 2 sávra
+szűkülő átmenet a sávok sorrendjét tartja meg, a változatlan 2-ről 2 sávos
+folytatás pedig nem kényszerít felesleges váltást. Azonos sáv útvonalán,
+egymást követő rövid OSM-éleken és közös cél-sávba történő besoroláskor is
+legalább 7,5 méteres modellbeli járműköz marad. A torlódási becslés 40 méteres
+útvonalablakot használ, az egyes vezetők szabadforgalmi sebességaránya pedig a
+rövid élek között is megmarad.
 A piros lámpánál csak az első autó áll a stopvonalhoz, a követők rendezett sort
 alkotnak mögötte; egy másik sáv álló járműve nem blokkolja a szabad sávot.
 Az ágensjelölők ugyanazt a folytonos zoomfüggő méretszabályt használják az
@@ -182,9 +213,20 @@ színmódban vékony, sötét körvonalat kap, hogy az egymásra érő ágensek 
 A pásztázáskor használt úttípus-, sáv-, LOD- és stílusmetaadatok a térkép
 betöltésekor egyszer készülnek el. A statikus térképréteg legfeljebb 1×,
 az ágensréteg legfeljebb 1,5× eszközpixelsűrűséget használ; így nagy DPI-jű
-kijelzőn sem nő négyszeresére mindkét teljes képernyős backing store. Ha egy élő
-state vizuális ágensadatai változatlanok (például álló sorban), a kliens nem
-indít hozzá újabb, üres 60 fps-es interpolációs ciklust.
+kijelzőn sem nő négyszeresére mindkét teljes képernyős backing store. A statikus
+worker kész `ImageBitmap` képe Chrome-ban `bitmaprenderer` átadással, köztes 2D
+`drawImage`-másolás nélkül kerül a látható canvasra; támogatás- vagy futásidejű
+hiba esetén automatikusan megmarad a 2D fallback. Ha egy élő state vizuális
+ágensadatai változatlanok (például álló sorban), a kliens nem indít hozzá újabb,
+üres 60 fps-es interpolációs ciklust.
+
+A két opcionális előkészítési mód alapból ki van kapcsolva, így a jelenlegi
+takarékos renderelés marad az alapértelmezés. Bekapcsoláskor egy második worker
+512 képpontos, túlnyúlással rajzolt csempéket készít. A gyorsítótár legfeljebb
+256 MiB becsült képmemóriát tart meg; a teljes kerület felbontását szükség esetén
+ehhez a biztonságos kerethez igazítja. Kikapcsoláskor a worker, a csempék és a
+kapcsolódó canvas backing store-ok felszabadulnak. A választás a böngésző helyi
+tárolójában megmarad.
 
 5000 ágensnél a mért régi teljes state 1 814 487 bájt volt. Az új gzipelt első
 full 75 579 bájt, a 20 egymást követő gzipelt delta átlaga 62 987 bájt lett. A
@@ -201,6 +243,7 @@ node tests\test_agent_appearance.mjs
 node tests\test_replay_buffer.mjs
 node tests\test_replay_app_flow.mjs
 node tests\test_replay_ui_contract.mjs
+node tests\test_static_map_worker.mjs
 ```
 
 A tesztek hálózati kérés nélkül ellenőrzik többek között az OSM-konverziót, `oneway` irányokat, sávokat, kanyarodási tiltásokat, gráfcsupaszítást, közlekedési módokat, POI-feldolgozást, földrajzi OD-diverzitást, snap-limitet, peremkapukat, rövid élek dinamikus kapacitását, sávfolytonosságot, járműközt, piros lámpás sorokat, relocation-jelzést, replay-időzítést és -memóriakorlátot, UTF-8 HTTP-hibákat, gzip kimenetet, full/delta rekonstrukciót, automatikus resyncet, ágensmozgást és népesség-átméretezést.

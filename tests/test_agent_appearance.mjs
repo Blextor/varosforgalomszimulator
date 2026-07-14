@@ -235,19 +235,13 @@ let strokeCount = 0;
 let batchCount = 0;
 let carPolygonCount = 0;
 let pedestrianArcCount = 0;
-let lastStrokePath = null;
+let pathObjectCount = 0;
 const paintOperations = [];
 const originalPath2D = globalThis.Path2D;
 class TestPath2D {
   constructor() {
-    this.addedPaths = [];
+    pathObjectCount += 1;
   }
-
-  moveTo() {}
-  lineTo() {}
-  closePath() { carPolygonCount += 1; }
-  arc() { pedestrianArcCount += 1; }
-  addPath(path) { this.addedPaths.push(path); }
 }
 globalThis.Path2D = TestPath2D;
 const context = {
@@ -258,11 +252,22 @@ const context = {
   lineTo() {},
   closePath() { carPolygonCount += 1; },
   arc() { pedestrianArcCount += 1; },
-  fill() { fillCount += 1; paintOperations.push("fill"); },
-  stroke(path) {
+  fill() {
+    fillCount += 1;
+    paintOperations.push({
+      type: "fill",
+      alpha: this._globalAlpha,
+      fillStyle: this._fillStyle,
+    });
+  },
+  stroke() {
     strokeCount += 1;
-    lastStrokePath = path;
-    paintOperations.push("stroke");
+    paintOperations.push({
+      type: "stroke",
+      alpha: this._globalAlpha,
+      strokeStyle: this._strokeStyle,
+      lineWidth: this._lineWidth,
+    });
   },
   set globalAlpha(value) { this._globalAlpha = value; },
   set fillStyle(value) { this._fillStyle = value; },
@@ -276,15 +281,32 @@ const waitingCarCount = overviewMap.renderedAgents.filter((entry) => (
 const waitingPedestrianCount = overviewMap.renderedAgents.filter((entry) => (
   entry.agent.mode === "pedestrian" && entry.agent.waiting
 )).length;
-assert.equal(carPolygonCount, 2_500 + waitingCarCount);
-assert.equal(pedestrianArcCount, 2_500 + waitingPedestrianCount);
-assert.equal(batchCount, 0);
+const visibleCarCount = overviewMap.renderedAgents.filter((entry) => (
+  entry.agent.mode === "car"
+)).length;
+const visiblePedestrianCount = overviewMap.renderedAgents.length - visibleCarCount;
+assert.equal(carPolygonCount, visibleCarCount + waitingCarCount);
+assert.equal(pedestrianArcCount, visiblePedestrianCount + waitingPedestrianCount);
+assert.equal(batchCount, 17);
 assert.equal(fillCount, 17);
-assert.equal(strokeCount, 1);
-assert.ok(batchCount <= 17, `Túl sok rajzolási batch: ${batchCount}`);
+assert.equal(strokeCount, 16);
 
-assert.equal(lastStrokePath.addedPaths.length, 16);
-assert.equal(paintOperations.at(-1), "stroke");
+assert.equal(pathObjectCount, 0);
+for (let index = 0; index < 32; index += 2) {
+  assert.equal(paintOperations[index].type, "fill");
+  assert.equal(paintOperations[index].alpha, 0.96);
+  assert.equal(paintOperations[index + 1].type, "stroke");
+  assert.equal(paintOperations[index + 1].strokeStyle, "rgba(7, 16, 15, 0.82)");
+  assert.equal(
+    paintOperations[index + 1].lineWidth,
+    localMap.agentVisualMetrics(overviewMap.zoom).outlineWidth * 2,
+  );
+}
+assert.deepEqual(paintOperations.at(-1), {
+  type: "fill",
+  alpha: 0.24,
+  fillStyle: "#07100f",
+});
 
 const batchCache = overviewMap.overviewColorBatches;
 const cachedScreenArrays = [...batchCache.values()].map((batch) => [

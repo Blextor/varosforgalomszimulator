@@ -16,6 +16,10 @@ const dom = {
   datasetPanel: document.querySelector("#dataset-panel"),
   networkStatus: document.querySelector("#network-status"),
   networkDetails: document.querySelector("#network-details"),
+  mapRenderControls: document.querySelector(".map-render-controls"),
+  prepareAllMapLayers: document.querySelector("#prepare-all-map-layers"),
+  renderFullMap: document.querySelector("#render-full-map"),
+  mapRenderStatus: document.querySelector("#map-render-status"),
   reloadNetwork: document.querySelector("#reload-network"),
   mapPlaceholder: document.querySelector("#map-placeholder"),
   routeStatus: document.querySelector("#route-status"),
@@ -26,6 +30,8 @@ const dom = {
   simulationSpeed: document.querySelector("#simulation-speed"),
   carIndividualColors: document.querySelector("#car-individual-colors"),
   pedestrianIndividualColors: document.querySelector("#pedestrian-individual-colors"),
+  trafficHeatmap: document.querySelector("#traffic-heatmap"),
+  legendTrafficHeatmap: document.querySelector("#legend-traffic-heatmap"),
   startPause: document.querySelector("#start-pause"),
   startPauseIcon: document.querySelector("#start-pause .button-icon"),
   startPauseLabel: document.querySelector("#start-pause .button-label"),
@@ -55,6 +61,8 @@ const dom = {
 };
 
 const AGENT_COLOR_STORAGE_KEY = "ujbuda-traffic-agent-color-modes-v1";
+const MAP_RENDER_OPTIONS_STORAGE_KEY = "ujbuda-traffic-map-render-options-v1";
+const TRAFFIC_HEATMAP_STORAGE_KEY = "ujbuda-traffic-heatmap-v1";
 
 function normalizeStoredAgentColorModes(value) {
   const source = value && typeof value === "object" ? value : {};
@@ -84,6 +92,50 @@ function persistAgentColorModes(colorModes) {
   }
 }
 
+function normalizeStoredMapRenderOptions(value) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    prepareAllLayers: source.prepareAllLayers === true,
+    renderFullMap: source.renderFullMap === true,
+  };
+}
+
+function loadMapRenderOptions() {
+  try {
+    const serialized = globalThis.localStorage?.getItem(MAP_RENDER_OPTIONS_STORAGE_KEY);
+    return normalizeStoredMapRenderOptions(serialized ? JSON.parse(serialized) : null);
+  } catch {
+    return normalizeStoredMapRenderOptions();
+  }
+}
+
+function persistMapRenderOptions(options) {
+  try {
+    globalThis.localStorage?.setItem(
+      MAP_RENDER_OPTIONS_STORAGE_KEY,
+      JSON.stringify(normalizeStoredMapRenderOptions(options)),
+    );
+  } catch {
+    // A megjelenítési mód tároló nélkül is azonnal működik.
+  }
+}
+
+function loadTrafficHeatmapEnabled() {
+  try {
+    return globalThis.localStorage?.getItem(TRAFFIC_HEATMAP_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function persistTrafficHeatmapEnabled(enabled) {
+  try {
+    globalThis.localStorage?.setItem(TRAFFIC_HEATMAP_STORAGE_KEY, enabled ? "1" : "0");
+  } catch {
+    // A hőtérkép tároló nélkül is azonnal működik.
+  }
+}
+
 function createStateClientId() {
   if (globalThis.crypto?.randomUUID) {
     return globalThis.crypto.randomUUID();
@@ -101,6 +153,8 @@ const state = {
   running: false,
   polling: false,
   pollAgain: false,
+  viewportInteracting: false,
+  viewportUiDirty: false,
   skipNextIntervalSample: false,
   pollTimer: null,
   settingsTimer: null,
@@ -113,6 +167,13 @@ const state = {
   poiCategoryCounts: new Map(),
   activePoiCategories: new Set(),
   agentColorModes: loadAgentColorModes(),
+  mapRenderOptions: loadMapRenderOptions(),
+  trafficHeatmapEnabled: loadTrafficHeatmapEnabled(),
+  segmentStatistics: new Map(),
+  segmentStatisticsWindowSeconds: 60,
+  segmentStatsTimer: null,
+  segmentStatsPolling: false,
+  staticPreparationStatus: { phase: "idle" },
   selectedFeature: null,
   selectedRoute: null,
   serverInstanceId: null,
@@ -152,6 +213,109 @@ function setAgentColorMode(mode, individual) {
   state.localMap?.setAgentColorModes?.(state.agentColorModes);
 }
 
+function syncTrafficHeatmapControls() {
+  dom.trafficHeatmap.checked = state.trafficHeatmapEnabled;
+  dom.legendTrafficHeatmap.hidden = !state.trafficHeatmapEnabled;
+}
+
+function setTrafficHeatmapEnabled(enabled) {
+  state.trafficHeatmapEnabled = Boolean(enabled);
+  persistTrafficHeatmapEnabled(state.trafficHeatmapEnabled);
+  syncTrafficHeatmapControls();
+  state.localMap?.setTrafficHeatmapEnabled?.(state.trafficHeatmapEnabled);
+  scheduleSegmentStatisticsPoll(0);
+}
+
+function syncMapRenderControls() {
+  dom.prepareAllMapLayers.checked = state.mapRenderOptions.prepareAllLayers;
+  dom.renderFullMap.checked = state.mapRenderOptions.renderFullMap;
+}
+
+function staticPreparationMessage(status) {
+  const phase = status.phase;
+  if (phase === "initializing") {
+    return "A gyorsított térkép-előkészítő indítása…";
+  }
+  if (phase === "preparing") {
+    const completed = Number(status.completed ?? status.completedLayers);
+    const total = Number(status.total ?? status.totalLayers);
+    if (Number.isFinite(completed) && Number.isFinite(total) && total > 0) {
+      return `Térképrétegek előkészítése: ${Math.max(0, Math.min(total, completed))}/${total}…`;
+    }
+    return "Térképrétegek előkészítése…";
+  }
+  if (phase === "ready") {
+    if (state.mapRenderOptions.prepareAllLayers && state.mapRenderOptions.renderFullMap) {
+      return "Minden részletességi szint és a teljes kerület előkészítve.";
+    }
+    if (state.mapRenderOptions.prepareAllLayers) {
+      return "Minden részletességi szint előkészítve.";
+    }
+    if (state.mapRenderOptions.renderFullMap) {
+      return "A teljes kerület előkészítve.";
+    }
+    return "Takarékos mód · csak a látható környezet készül el.";
+  }
+  if (phase === "limited") {
+    return "A gyorsított mód részben készült el · a biztonságos memóriahatár aktív.";
+  }
+  if (phase === "fallback") {
+    return "Az előkészítés nem sikerült; a takarékos mód maradt aktív.";
+  }
+  if (state.mapRenderOptions.prepareAllLayers || state.mapRenderOptions.renderFullMap) {
+    return "A gyorsított előkészítés a térkép betöltésekor indul.";
+  }
+  return "Takarékos mód · csak a látható környezet készül el.";
+}
+
+function renderStaticPreparationStatus(status) {
+  const busy = status.phase === "initializing" || status.phase === "preparing";
+  setDomProperty(dom.mapRenderStatus, "textContent", staticPreparationMessage(status));
+  dom.mapRenderStatus.setAttribute("aria-busy", String(busy));
+  dom.mapRenderControls.setAttribute("aria-busy", String(busy));
+}
+
+function handleStaticPreparationChange(value) {
+  const source = typeof value === "string" ? { phase: value } : value;
+  const phase = ["idle", "initializing", "preparing", "ready", "limited", "fallback"]
+    .includes(source?.phase)
+    ? source.phase
+    : "idle";
+  state.staticPreparationStatus = { ...(source || {}), phase };
+  if (state.viewportInteracting) {
+    state.viewportUiDirty = true;
+    return;
+  }
+  renderStaticPreparationStatus(state.staticPreparationStatus);
+}
+
+function setMapRenderOption(option, enabled) {
+  if (option !== "prepareAllLayers" && option !== "renderFullMap") {
+    return false;
+  }
+  const nextOptions = normalizeStoredMapRenderOptions({
+    ...state.mapRenderOptions,
+    [option]: Boolean(enabled),
+  });
+  const changed = (
+    nextOptions.prepareAllLayers !== state.mapRenderOptions.prepareAllLayers
+    || nextOptions.renderFullMap !== state.mapRenderOptions.renderFullMap
+  );
+  if (!changed) {
+    return false;
+  }
+  state.mapRenderOptions = nextOptions;
+  persistMapRenderOptions(nextOptions);
+  syncMapRenderControls();
+  handleStaticPreparationChange({
+    phase: nextOptions.prepareAllLayers || nextOptions.renderFullMap
+      ? "initializing"
+      : "idle",
+  });
+  state.localMap?.setStaticRenderOptions?.({ ...nextOptions });
+  return changed;
+}
+
 function nextPollDelay(elapsedMs = 0) {
   return pollDelayAfterElapsed({
     running: state.running,
@@ -187,6 +351,17 @@ function scheduleImmediateSimulationPoll() {
   scheduleSimulationPoll(0);
 }
 
+function handleViewportInteractionChange(interacting) {
+  const nextValue = Boolean(interacting);
+  if (state.viewportInteracting === nextValue) {
+    return;
+  }
+  state.viewportInteracting = nextValue;
+  if (!nextValue) {
+    flushDeferredViewportUi();
+  }
+}
+
 async function apiRequest(
   path,
   { method = "GET", body, cache = "no-store", timeoutMs = 15000 } = {},
@@ -213,6 +388,80 @@ async function apiRequest(
     throw error;
   } finally {
     window.clearTimeout(timeout);
+  }
+}
+
+function decodeSegmentStatistics(payload) {
+  const statistics = new Map();
+  for (const [segmentId, values] of Object.entries(payload?.segments || {})) {
+    if (!Array.isArray(values) || values.length < 6) {
+      continue;
+    }
+    const [passedCars, currentCars, averageSpeedKph, speedRatio, loadPercent, vehicleSeconds] = values;
+    statistics.set(String(segmentId), {
+      passedCars: Math.max(0, Number(passedCars) || 0),
+      currentCars: Math.max(0, Number(currentCars) || 0),
+      averageSpeedKph: Math.max(0, Number(averageSpeedKph) || 0),
+      speedRatio: Math.max(0, Number(speedRatio) || 0),
+      loadPercent: Math.max(0, Math.min(100, Number(loadPercent) || 0)),
+      vehicleSeconds: Math.max(0, Number(vehicleSeconds) || 0),
+      hasRecentTraffic: Number(vehicleSeconds) > 0 || Number(currentCars) > 0,
+    });
+  }
+  return statistics;
+}
+
+function selectedSegmentId() {
+  return state.selectedFeature?.type === "segment"
+    ? String(state.selectedFeature.segment.id)
+    : null;
+}
+
+function segmentStatisticsPath() {
+  const segmentId = selectedSegmentId();
+  if (state.trafficHeatmapEnabled) {
+    return segmentId
+      ? `/api/simulation/segments?includeSegmentId=${encodeURIComponent(segmentId)}`
+      : "/api/simulation/segments";
+  }
+  return segmentId
+    ? `/api/simulation/segments?segmentId=${encodeURIComponent(segmentId)}`
+    : null;
+}
+
+function scheduleSegmentStatisticsPoll(delay = 0) {
+  if (state.segmentStatsTimer !== null) {
+    window.clearTimeout(state.segmentStatsTimer);
+    state.segmentStatsTimer = null;
+  }
+  if (!state.configured || document.hidden || !segmentStatisticsPath()) {
+    return;
+  }
+  state.segmentStatsTimer = window.setTimeout(() => {
+    state.segmentStatsTimer = null;
+    pollSegmentStatistics();
+  }, Math.max(0, delay));
+}
+
+async function pollSegmentStatistics() {
+  const path = segmentStatisticsPath();
+  if (!state.configured || document.hidden || !path || state.segmentStatsPolling) {
+    return;
+  }
+  state.segmentStatsPolling = true;
+  try {
+    const payload = await apiRequest(path, { timeoutMs: 10000 });
+    state.segmentStatisticsWindowSeconds = Number(payload.windowSeconds) || 60;
+    state.segmentStatistics = decodeSegmentStatistics(payload);
+    state.localMap?.setSegmentStatistics?.(state.segmentStatistics);
+    if (state.selectedFeature?.type === "segment") {
+      inspectSegment(state.selectedFeature.segment);
+    }
+  } catch (error) {
+    console.warn("Az útszakasz-statisztika átmenetileg nem frissült.", error);
+  } finally {
+    state.segmentStatsPolling = false;
+    scheduleSegmentStatisticsPoll(state.running ? 1000 : 1800);
   }
 }
 
@@ -293,6 +542,12 @@ function replayElapsedSeconds(timeline, sequence, metadata) {
   return summary?.endSimulationTimeSeconds ?? summary?.simulationTimeSeconds ?? null;
 }
 
+function setDomProperty(element, property, value) {
+  if (element[property] !== value) {
+    element[property] = value;
+  }
+}
+
 function updateReplayUi() {
   const timeline = activeReplayTimeline();
   const metadata = state.replayPlaybackMetadata
@@ -306,25 +561,45 @@ function updateReplayUi() {
     ? newest
     : Math.min(newest ?? 0, Math.max(oldest ?? 0, state.replayCursorSequence ?? 0));
 
-  dom.replayRange.min = String(oldest ?? 0);
-  dom.replayRange.max = String(newest ?? 0);
-  dom.replayRange.value = String(cursor ?? 0);
-  dom.replayRange.disabled = !state.configured || !hasHistory;
-  dom.replayLive.disabled = !state.configured || state.replayMode === "live" || !hasFrames;
-  dom.replayPlay.disabled = !state.configured || state.replayMode === "live" || !hasHistory;
-  dom.replayPlayIcon.textContent = state.replayPlaying ? "Ⅱ" : "▶";
-  dom.replayPlayLabel.textContent = state.replayPlaying ? "Megállítás" : "Lejátszás";
+  setDomProperty(dom.replayRange, "min", String(oldest ?? 0));
+  setDomProperty(dom.replayRange, "max", String(newest ?? 0));
+  setDomProperty(dom.replayRange, "value", String(cursor ?? 0));
+  setDomProperty(dom.replayRange, "disabled", !state.configured || !hasHistory);
+  setDomProperty(
+    dom.replayLive,
+    "disabled",
+    !state.configured || state.replayMode === "live" || !hasFrames,
+  );
+  setDomProperty(
+    dom.replayPlay,
+    "disabled",
+    !state.configured || state.replayMode === "live" || !hasHistory,
+  );
+  setDomProperty(dom.replayPlayIcon, "textContent", state.replayPlaying ? "Ⅱ" : "▶");
+  setDomProperty(
+    dom.replayPlayLabel,
+    "textContent",
+    state.replayPlaying ? "Megállítás" : "Lejátszás",
+  );
 
   if (!hasFrames) {
-    dom.replayPosition.textContent = "Az előzmény gyűjtése induláskor kezdődik.";
+    setDomProperty(
+      dom.replayPosition,
+      "textContent",
+      "Az előzmény gyűjtése induláskor kezdődik.",
+    );
     return;
   }
   if (state.replayMode === "live") {
     const elapsed = state.latestLivePayload?.stats?.elapsedSeconds
       ?? state.replayMetadata.get(newest)?.stats?.elapsedSeconds;
-    dom.replayPosition.textContent = elapsed === null || elapsed === undefined
-      ? "Élő állapot"
-      : `Élő · ${formatClock(elapsed)}`;
+    setDomProperty(
+      dom.replayPosition,
+      "textContent",
+      elapsed === null || elapsed === undefined
+        ? "Élő állapot"
+        : `Élő · ${formatClock(elapsed)}`,
+    );
     return;
   }
   const selectedTime = replayElapsedSeconds(timeline, cursor, metadata);
@@ -336,9 +611,13 @@ function updateReplayUi() {
   const ageLabel = Number.isFinite(age) && age > 0
     ? ` · ${formatDecimal(age)} szimulált mp-cel korábban`
     : "";
-  dom.replayPosition.textContent = selectedTime === null || selectedTime === undefined
-    ? `Korábbi állapot${ageLabel}`
-    : `${formatClock(selectedTime)}${ageLabel}`;
+  setDomProperty(
+    dom.replayPosition,
+    "textContent",
+    selectedTime === null || selectedTime === undefined
+      ? `Korábbi állapot${ageLabel}`
+      : `${formatClock(selectedTime)}${ageLabel}`,
+  );
 }
 
 function resetReplayHistory() {
@@ -364,7 +643,7 @@ function pruneReplayMetadata() {
   }
 }
 
-function recordReplayPayload(payload, { force = false } = {}) {
+function recordReplayPayload(payload, { force = false, refreshUi = true } = {}) {
   const agents = Array.isArray(payload.agents) ? payload.agents : [];
   const result = state.replayBuffer.append(agents, {
     timestampMs: performance.now(),
@@ -389,7 +668,9 @@ function recordReplayPayload(payload, { force = false } = {}) {
     state.replayCursorSequence = state.replayBuffer.oldestSequence;
     presentReplaySequence(state.replayCursorSequence);
   }
-  updateReplayUi();
+  if (refreshUi) {
+    updateReplayUi();
+  }
 }
 
 function showNotice(message, type = "error") {
@@ -402,14 +683,16 @@ function hideNotice() {
   dom.notice.hidden = true;
 }
 
-function setControlsEnabled(enabled) {
+function setControlsEnabled(enabled, { refreshReplayUi = true } = {}) {
   const liveEnabled = enabled && state.replayMode === "live";
   [dom.carCount, dom.pedestrianCount, dom.simulationSpeed].forEach((control) => {
-    control.disabled = !liveEnabled;
+    setDomProperty(control, "disabled", !liveEnabled);
   });
-  dom.startPause.disabled = !liveEnabled || state.controlPending;
-  dom.reset.disabled = !liveEnabled || state.controlPending;
-  updateReplayUi();
+  setDomProperty(dom.startPause, "disabled", !liveEnabled || state.controlPending);
+  setDomProperty(dom.reset, "disabled", !liveEnabled || state.controlPending);
+  if (refreshReplayUi) {
+    updateReplayUi();
+  }
 }
 
 function setControlPending(pending) {
@@ -427,11 +710,39 @@ function renderStats(stats) {
   if (!stats) {
     return;
   }
-  dom.carSpeed.textContent = formatDecimal(stats.averageCarSpeedKph);
-  dom.pedestrianSpeed.textContent = formatDecimal(stats.averagePedestrianSpeedKph);
-  dom.congestion.textContent = Math.round(stats.congestionPercent || 0).toLocaleString("hu-HU");
-  dom.completedTrips.textContent = formatInteger(stats.completedTrips);
-  dom.clock.textContent = formatClock(stats.elapsedSeconds || 0);
+  setDomProperty(dom.carSpeed, "textContent", formatDecimal(stats.averageCarSpeedKph));
+  setDomProperty(
+    dom.pedestrianSpeed,
+    "textContent",
+    formatDecimal(stats.averagePedestrianSpeedKph),
+  );
+  setDomProperty(
+    dom.congestion,
+    "textContent",
+    Math.round(stats.congestionPercent || 0).toLocaleString("hu-HU"),
+  );
+  setDomProperty(dom.completedTrips, "textContent", formatInteger(stats.completedTrips));
+  setDomProperty(dom.clock, "textContent", formatClock(stats.elapsedSeconds || 0));
+}
+
+function flushDeferredViewportUi() {
+  if (!state.viewportUiDirty) {
+    return;
+  }
+  state.viewportUiDirty = false;
+  if (state.replayMode === "live" && state.latestLivePayload) {
+    syncSettingsControls(state.latestLivePayload);
+    renderStats(state.latestLivePayload.stats);
+  }
+  if (state.selectedFeature?.type === "agent") {
+    inspectAgent(state.selectedFeature.agent);
+  } else if (!state.selectedFeature) {
+    dom.inspector.hidden = true;
+  }
+  renderStaticPreparationStatus(state.staticPreparationStatus);
+  updateRunningUi({ refreshReplayUi: false });
+  setControlsEnabled(state.configured, { refreshReplayUi: false });
+  updateReplayUi();
 }
 
 function syncSettingsControls(payload) {
@@ -440,40 +751,54 @@ function syncSettingsControls(payload) {
     document.activeElement !== dom.carCount
     && Number.isFinite(Number(stats.cars))
   ) {
-    dom.carCount.value = String(stats.cars);
-    dom.carCountValue.textContent = dom.carCount.value;
+    const value = String(stats.cars);
+    setDomProperty(dom.carCount, "value", value);
+    setDomProperty(dom.carCountValue, "textContent", value);
   }
   if (
     document.activeElement !== dom.pedestrianCount
     && Number.isFinite(Number(stats.pedestrians))
   ) {
-    dom.pedestrianCount.value = String(stats.pedestrians);
-    dom.pedestrianCountValue.textContent = dom.pedestrianCount.value;
+    const value = String(stats.pedestrians);
+    setDomProperty(dom.pedestrianCount, "value", value);
+    setDomProperty(dom.pedestrianCountValue, "textContent", value);
   }
   if (
     document.activeElement !== dom.simulationSpeed
     && payload.speedMultiplier !== undefined
   ) {
-    dom.simulationSpeed.value = String(payload.speedMultiplier);
+    setDomProperty(dom.simulationSpeed, "value", String(payload.speedMultiplier));
   }
 }
 
-function updateRunningUi() {
-  dom.startPauseIcon.textContent = state.running ? "Ⅱ" : "▶";
-  dom.startPauseLabel.textContent = state.running ? "Szünet" : "Indítás";
+function updateRunningUi({ refreshReplayUi = true } = {}) {
+  setDomProperty(dom.startPauseIcon, "textContent", state.running ? "Ⅱ" : "▶");
+  setDomProperty(dom.startPauseLabel, "textContent", state.running ? "Szünet" : "Indítás");
   if (state.configured) {
     if (state.replayMode !== "live") {
-      dom.routeStatus.textContent = state.replayPlaying
-        ? "Korábbi állapotok visszajátszása · a Python motor a háttérben fut"
-        : "Korábbi állapot megtekintése · a Python motor a háttérben fut";
-      updateReplayUi();
+      setDomProperty(
+        dom.routeStatus,
+        "textContent",
+        state.replayPlaying
+          ? "Korábbi állapotok visszajátszása · a Python motor a háttérben fut"
+          : "Korábbi állapot megtekintése · a Python motor a háttérben fut",
+      );
+      if (refreshReplayUi) {
+        updateReplayUi();
+      }
       return;
     }
-    dom.routeStatus.textContent = state.running
-      ? "Helyi úthálózat · Python motor fut"
-      : "Helyi úthálózat · szünetel";
+    setDomProperty(
+      dom.routeStatus,
+      "textContent",
+      state.running
+        ? "Helyi úthálózat · Python motor fut"
+        : "Helyi úthálózat · szünetel",
+    );
   }
-  updateReplayUi();
+  if (refreshReplayUi) {
+    updateReplayUi();
+  }
 }
 
 function selectedSimulationStatePath() {
@@ -541,6 +866,7 @@ function presentSimulationPayload(
     historical = false,
     transitionDurationMs = null,
     renderStatistics = true,
+    renderDetails = true,
   } = {},
 ) {
   const agents = Array.isArray(payload.agents) ? payload.agents : [];
@@ -582,9 +908,16 @@ function presentSimulationPayload(
           });
         }
       }
-      inspectAgent(currentAgent);
+      if (renderDetails) {
+        inspectAgent(currentAgent);
+      }
     } else {
-      inspectFeature(null);
+      state.selectedFeature = null;
+      state.selectedRoute = null;
+      state.localMap?.setSelectedAgentRoute(null);
+      if (renderDetails) {
+        dom.inspector.hidden = true;
+      }
     }
   }
   if (renderStatistics) {
@@ -598,6 +931,13 @@ function invalidateSimulationSession(message) {
   state.configured = false;
   state.running = false;
   state.simulationEpoch = null;
+  state.viewportUiDirty = false;
+  state.segmentStatistics.clear();
+  state.localMap?.setSegmentStatistics?.(state.segmentStatistics);
+  if (state.segmentStatsTimer !== null) {
+    window.clearTimeout(state.segmentStatsTimer);
+    state.segmentStatsTimer = null;
+  }
   resetReplayHistory();
   state.localMap?.setAgents([], { animate: false, resetTiming: true });
   inspectFeature(null);
@@ -610,6 +950,7 @@ function invalidateSimulationSession(message) {
 
 function consumeSimulationState(payload, { observeInterval = false } = {}) {
   const previousRunning = state.running;
+  const deferViewportUi = state.viewportInteracting;
   let epochChanged = false;
   if (
     payload.serverInstanceId
@@ -640,14 +981,21 @@ function consumeSimulationState(payload, { observeInterval = false } = {}) {
     if (epochChanged) {
       inspectFeature(null);
       resetReplayHistory();
+      state.segmentStatistics.clear();
+      state.localMap?.setSegmentStatistics?.(state.segmentStatistics);
     }
     state.simulationEpoch = payload.simulationEpoch;
   }
   state.running = Boolean(payload.running);
-  syncSettingsControls(payload);
+  if (deferViewportUi) {
+    state.viewportUiDirty = true;
+  } else {
+    syncSettingsControls(payload);
+  }
   state.latestLivePayload = payload;
   recordReplayPayload(payload, {
     force: epochChanged || state.replayBuffer.length === 0 || state.running !== previousRunning,
+    refreshUi: false,
   });
   if (state.replayMode === "live") {
     presentSimulationPayload(payload, {
@@ -656,10 +1004,15 @@ function consumeSimulationState(payload, { observeInterval = false } = {}) {
         observeInterval && state.running && previousRunning && !epochChanged
       ),
       resetTiming: epochChanged || state.running !== previousRunning,
+      renderStatistics: !deferViewportUi,
+      renderDetails: !deferViewportUi,
     });
   }
-  updateRunningUi();
-  setControlsEnabled(state.configured);
+  if (!deferViewportUi) {
+    updateRunningUi({ refreshReplayUi: false });
+    setControlsEnabled(state.configured, { refreshReplayUi: false });
+    updateReplayUi();
+  }
   return true;
 }
 
@@ -888,6 +1241,8 @@ function inspectSegment(segment) {
     : "";
   const speed = segment.maxSpeedKph || edges.find((edge) => edge.maxSpeedKph)?.maxSpeedKph;
   const turns = turnLaneSummary(edges);
+  const statistics = state.segmentStatistics.get(String(segment.id));
+  const windowSeconds = Math.round(state.segmentStatisticsWindowSeconds || 60);
   const modeLabels = {
     car: "csak gépjárműforgalom",
     pedestrian: "csak gyalogosforgalom",
@@ -900,6 +1255,15 @@ function inspectSegment(segment) {
     segment.highway ? `OSM: ${segment.highway}` : null,
     speed ? `${speed} km/h` : null,
     turns ? `Kanyarodási sávok: ${turns}` : "Nincs rögzített turn:lanes adat",
+    statistics
+      ? `Áthaladt autók: ${formatInteger(statistics.passedCars)}`
+      : "Forgalmi statisztika betöltése…",
+    statistics?.hasRecentTraffic
+      ? `Utolsó ${windowSeconds} mp: ${formatDecimal(statistics.averageSpeedKph)} km/h (${Math.round(statistics.speedRatio * 100)}% a korláthoz képest)`
+      : statistics ? `Az utolsó ${windowSeconds} mp-ben nem volt mért autóforgalom` : null,
+    statistics?.hasRecentTraffic
+      ? `Terheltség: ${Math.round(statistics.loadPercent)}% · most ${formatInteger(statistics.currentCars)} autó`
+      : null,
   ];
   showInspector(name, parts);
 }
@@ -1003,6 +1367,7 @@ function inspectFeature(feature) {
   }
   if (!feature) {
     dom.inspector.hidden = true;
+    scheduleSegmentStatisticsPoll(0);
     return;
   }
   if (feature.type === "poi") {
@@ -1012,6 +1377,7 @@ function inspectFeature(feature) {
   } else if (feature.type === "segment") {
     inspectSegment(feature.segment);
   }
+  scheduleSegmentStatisticsPoll(0);
 }
 
 function categoryDescriptor(category) {
@@ -1202,6 +1568,8 @@ async function initializeApplication() {
       inspectFeature(null);
       state.localMap?.destroy();
       state.localMap = null;
+      state.viewportInteracting = false;
+      state.viewportUiDirty = false;
       state.network = null;
       state.stateProtocolCache = createStateProtocolCache();
       resetReplayHistory();
@@ -1226,11 +1594,18 @@ async function initializeApplication() {
       state.edgesBySegment = buildSegmentEdgeIndex(network);
       state.localMap?.destroy();
       state.localMap = null;
+      state.viewportInteracting = false;
+      state.viewportUiDirty = false;
       renderPoiFilters(network);
       state.localMap = new LocalTrafficMap(document.querySelector("#map"), network, {
         onFeatureSelect: inspectFeature,
+        onViewportInteractionChange: handleViewportInteractionChange,
         agentColorModes: state.agentColorModes,
+        staticRenderOptions: state.mapRenderOptions,
+        onStaticPreparationChange: handleStaticPreparationChange,
       });
+      state.localMap.setTrafficHeatmapEnabled(state.trafficHeatmapEnabled);
+      state.localMap.setSegmentStatistics(state.segmentStatistics);
     }
 
     let configured = null;
@@ -1323,6 +1698,7 @@ async function initializeApplication() {
     state.connectionNoticeShown = false;
     hideNotice();
     scheduleSimulationPoll(0);
+    scheduleSegmentStatisticsPoll(0);
   } catch (error) {
     if (requestGeneration !== state.requestGeneration) {
       return;
@@ -1394,6 +1770,10 @@ document.addEventListener("visibilitychange", () => {
       window.clearTimeout(state.pollTimer);
       state.pollTimer = null;
     }
+    if (state.segmentStatsTimer !== null) {
+      window.clearTimeout(state.segmentStatsTimer);
+      state.segmentStatsTimer = null;
+    }
     state.localMap?.resetAgentTiming();
     updateRunningUi();
     return;
@@ -1401,6 +1781,7 @@ document.addEventListener("visibilitychange", () => {
   state.localMap?.resetAgentTiming();
   if (state.configured) {
     scheduleImmediateSimulationPoll();
+    scheduleSegmentStatisticsPoll(0);
   } else if (!state.configured) {
     scheduleInitializationRetry(0);
   }
@@ -1424,6 +1805,15 @@ dom.carIndividualColors.addEventListener("change", (event) => {
 });
 dom.pedestrianIndividualColors.addEventListener("change", (event) => {
   setAgentColorMode("pedestrian", event.currentTarget.checked);
+});
+dom.trafficHeatmap.addEventListener("change", (event) => {
+  setTrafficHeatmapEnabled(event.currentTarget.checked);
+});
+dom.prepareAllMapLayers.addEventListener("change", (event) => {
+  setMapRenderOption("prepareAllLayers", event.currentTarget.checked);
+});
+dom.renderFullMap.addEventListener("change", (event) => {
+  setMapRenderOption("renderFullMap", event.currentTarget.checked);
 });
 dom.replayRange.addEventListener("input", () => {
   const sequence = Number(dom.replayRange.value);
@@ -1499,5 +1889,8 @@ dom.reset.addEventListener("click", async () => {
 });
 
 syncAgentColorControls();
+syncMapRenderControls();
+syncTrafficHeatmapControls();
+renderStaticPreparationStatus(state.staticPreparationStatus);
 updateReplayUi();
 initializeApplication();

@@ -44,6 +44,264 @@ assert.deepEqual(
 assert.equal(localMapModule.baseOverscanForViewport(1_000, 760), 380);
 assert.equal(localMapModule.baseOverscanForViewport(1_530, 1_080), 512);
 assert.equal(localMapModule.baseOverscanForViewport(200, 100), 160);
+assert.equal(localMapModule.agentPixelRatioForLoad(1.5, 2_999, {
+  car: "individual",
+  pedestrian: "individual",
+}), 1.5);
+assert.equal(localMapModule.agentPixelRatioForLoad(1.5, 3_000, {
+  car: "individual",
+  pedestrian: "uniform",
+}), 1);
+assert.equal(localMapModule.agentPixelRatioForLoad(2, 5_000, {
+  car: "uniform",
+  pedestrian: "uniform",
+}), 1.5);
+assert.equal(localMapModule.agentPixelRatioForLoad(1.5, 2_999, {
+  car: "individual",
+  pedestrian: "uniform",
+}, 1), 1);
+assert.equal(localMapModule.agentPixelRatioForLoad(1.5, 2_499, {
+  car: "individual",
+  pedestrian: "uniform",
+}, 1), 1.5);
+
+assert.deepEqual(localMapModule.normalizeStaticRenderOptions({
+  prepareAllLayers: true,
+  renderFullMap: 1,
+}), {
+  prepareAllLayers: true,
+  renderFullMap: false,
+});
+assert.equal(localMapModule.staticRenderProfileForZoom(0.81).zoom, 0.8);
+assert.equal(localMapModule.staticRenderProfileForZoom(6.8).zoom, 3.5);
+assert.equal(localMapModule.staticRenderProfileForZoom(7).zoom, 7);
+assert.equal(localMapModule.staticRenderProfileForZoom(40).zoom, 40);
+assert.equal(localMapModule.trafficLoadColor(0), "hsl(120.0 78% 48%)");
+assert.equal(localMapModule.trafficLoadColor(50), "hsl(60.0 78% 48%)");
+assert.equal(localMapModule.trafficLoadColor(100), "hsl(0.0 78% 48%)");
+
+const compactFullMapPlan = localMapModule.boundedFullMapTilePlan(
+  7_346.7,
+  6_805.1,
+  0.1,
+  { maxTiles: 48 },
+);
+assert.equal(compactFullMapPlan.limited, false);
+assert.ok(compactFullMapPlan.tileCount <= 48);
+assert.ok(compactFullMapPlan.firstColumn < 0);
+assert.ok(compactFullMapPlan.firstRow < 0);
+const boundedFullMapPlan = localMapModule.boundedFullMapTilePlan(
+  7_346.7,
+  6_805.1,
+  4,
+  { maxTiles: 48 },
+);
+assert.equal(boundedFullMapPlan.limited, true);
+assert.ok(boundedFullMapPlan.scale < 4);
+assert.ok(boundedFullMapPlan.tileCount <= 48);
+
+const staticModeStatuses = [];
+const staticModeMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+Object.assign(staticModeMap, {
+  staticRenderOptions: { prepareAllLayers: false, renderFullMap: false },
+  staticTileGeneration: 0,
+  staticTileCache: new Map(),
+  staticTileCacheBytes: 0,
+  staticTileQueue: [],
+  staticTileQueuedKeys: new Set(),
+  staticTilePlanKeys: new Set(),
+  staticTileCompletedKeys: new Set(),
+  staticTileDetailLevels: new Map(),
+  staticTileFullLevels: new Map(),
+  staticFullMapLayer: { style: {}, replaceChildren() {}, hidden: false },
+  staticTileLayer: { style: {}, replaceChildren() {}, hidden: false },
+  viewportLayer: { style: {} },
+  agentCanvas: { style: {} },
+  onStaticPreparationChange(status) { staticModeStatuses.push(status); },
+});
+assert.deepEqual(staticModeMap.setStaticRenderOptions({ prepareAllLayers: true }), {
+  prepareAllLayers: true,
+  renderFullMap: false,
+});
+assert.equal(staticModeMap.staticTileFailed, true);
+assert.equal(staticModeStatuses.at(-1).phase, "fallback");
+staticModeMap.setStaticRenderOptions({});
+assert.equal(staticModeStatuses.at(-1).phase, "idle");
+assert.equal(staticModeMap.staticFullMapLayer.hidden, true);
+assert.equal(staticModeMap.staticTileLayer.hidden, true);
+
+const staleTileMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+let staleTilePumps = 0;
+Object.assign(staleTileMap, {
+  destroyed: false,
+  staticTileGeneration: 2,
+  staticTileTimeout: { type: "old-generation-timeout" },
+  staticTilePending: {
+    requestId: 7,
+    job: { generation: 1 },
+  },
+  pumpStaticTileQueue() { staleTilePumps += 1; },
+});
+staleTileMap.handleStaticTileTimeout(7);
+assert.equal(staleTileMap.staticTilePending, null);
+assert.equal(staleTileMap.staticTileFailed, undefined);
+assert.equal(staleTilePumps, 1);
+
+const boundedQueueMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+Object.assign(boundedQueueMap, {
+  staticTileGeneration: 1,
+  staticTilePlanKeys: new Set(),
+  staticTileCompletedKeys: new Set(),
+  staticTileQueuedKeys: new Set(),
+  staticTileQueue: [],
+  staticTileCache: new Map(),
+  staticTileCacheBytes: 0,
+  staticTilePending: null,
+  staticTilePlanLimited: false,
+});
+let acceptedTileJobs = 0;
+for (let index = 0; index < 300; index += 1) {
+  acceptedTileJobs += Number(boundedQueueMap.queueStaticTileJob({
+    key: `tile-${index}`,
+    generation: 1,
+    priority: 0,
+  }, { pump: false }));
+}
+assert.ok(acceptedTileJobs < 300);
+assert.equal(boundedQueueMap.staticTilePlanKeys.size, acceptedTileJobs);
+assert.equal(boundedQueueMap.staticTileQueue.length, acceptedTileJobs);
+assert.equal(boundedQueueMap.staticTilePlanLimited, true);
+
+const clippedSlotMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+clippedSlotMap.worldWidth = 7_346.7;
+clippedSlotMap.worldHeight = 6_805.1;
+const clippedSlot = { style: {} };
+const clippedCanvas = { style: {} };
+const clippedEntry = {
+  job: { column: -1, row: -1 },
+  slot: clippedSlot,
+  canvas: clippedCanvas,
+};
+assert.equal(clippedSlotMap.configureStaticTileSlot(clippedEntry, {
+  kind: "full",
+  scale: 0.1,
+}), true);
+assert.equal(clippedSlot.style.left, "-28px");
+assert.equal(clippedSlot.style.top, "-28px");
+assert.equal(clippedSlot.style.width, "28px");
+assert.equal(clippedSlot.style.height, "28px");
+
+let tileFallbackDraws = 0;
+let tileBitmapCloses = 0;
+const tileCanvases = [];
+const tileFallbackDocument = {
+  createElement(type) {
+    if (type === "canvas") {
+      const canvas = {
+        style: {},
+        getContext(kind) {
+          if (canvas === tileCanvases[0] && kind === "bitmaprenderer") {
+            return { transferFromImageBitmap() { throw new Error("lost bitmap presenter"); } };
+          }
+          if (canvas === tileCanvases[1] && kind === "2d") {
+            return { drawImage() { tileFallbackDraws += 1; } };
+          }
+          return null;
+        },
+      };
+      tileCanvases.push(canvas);
+      return canvas;
+    }
+    return { style: {}, append(child) { this.child = child; } };
+  },
+};
+const tileFallbackMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+tileFallbackMap.container = { ownerDocument: tileFallbackDocument };
+const tileFallbackEntry = tileFallbackMap.createStaticTileEntry({
+  key: "fallback-tile",
+  column: 0,
+  row: 0,
+}, {
+  width: 608,
+  height: 608,
+  close() { tileBitmapCloses += 1; },
+});
+assert.equal(tileCanvases.length, 2);
+assert.equal(tileFallbackEntry.canvas, tileCanvases[1]);
+assert.equal(tileCanvases[0].width, 0);
+assert.equal(tileFallbackDraws, 1);
+assert.equal(tileBitmapCloses, 1);
+
+const largeViewportPlanMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+Object.assign(largeViewportPlanMap, {
+  staticRenderOptions: { prepareAllLayers: true, renderFullMap: true },
+  staticTileReady: true,
+  staticTileWorker: {},
+  staticTileGeneration: 1,
+  staticRenderRevision: 0,
+  staticTileCache: new Map(),
+  staticTileCacheBytes: 0,
+  staticTileQueue: [],
+  staticTileQueuedKeys: new Set(),
+  staticTilePlanKeys: new Set(),
+  staticTileCompletedKeys: new Set(),
+  staticTileDetailLevels: new Map(),
+  staticTileFullLevels: new Map(),
+  staticTilePending: null,
+  staticTilePlanLimited: false,
+  zoom: 40,
+  fitScale: 0.1,
+  scale: 4,
+  width: 3_840,
+  height: 2_160,
+  centerX: 7_346.7 / 2,
+  centerY: 6_805.1 / 2,
+  worldWidth: 7_346.7,
+  worldHeight: 6_805.1,
+  updateStaticTilePresentation() {},
+  notifyStaticPreparation() {},
+  pumpStaticTileQueue() {},
+});
+assert.equal(largeViewportPlanMap.rebuildStaticTilePreparation(), true);
+assert.equal(
+  largeViewportPlanMap.staticTileFullLevels.size,
+  localMapModule.STATIC_RENDER_PROFILES.length,
+);
+assert.ok(largeViewportPlanMap.staticTilePlanKeys.size < 200);
+const activeFullLevel = largeViewportPlanMap.staticTileFullLevels.get("z40");
+for (const job of largeViewportPlanMap.staticTileJobsForRange(
+  activeFullLevel,
+  activeFullLevel.range,
+  5,
+)) {
+  assert.equal(largeViewportPlanMap.staticTilePlanKeys.has(job.key), true);
+}
+
+const originalWindow = globalThis.window;
+globalThis.window = { devicePixelRatio: 1 };
+try {
+  const resizeGuardMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+  Object.assign(resizeGuardMap, {
+    width: 100,
+    height: 80,
+    devicePixelRatio: 1,
+    viewportInteraction: null,
+    container: {
+      getBoundingClientRect: () => ({ width: 100, height: 80, left: 12, top: 34 }),
+    },
+  });
+  resizeGuardMap.drawBase = () => assert.fail("unchanged resize must not redraw base");
+  resizeGuardMap.drawAgents = () => assert.fail("unchanged resize must not redraw agents");
+  resizeGuardMap.resize(false);
+  assert.equal(resizeGuardMap.containerLeft, 12);
+  assert.equal(resizeGuardMap.containerTop, 34);
+} finally {
+  if (originalWindow === undefined) {
+    delete globalThis.window;
+  } else {
+    globalThis.window = originalWindow;
+  }
+}
 
 const viewportMap = Object.create(localMapModule.LocalTrafficMap.prototype);
 viewportMap.viewportInteraction = { centerX: 0, centerY: 0, scale: 1 };
@@ -54,8 +312,9 @@ viewportMap.width = 100;
 viewportMap.height = 80;
 viewportMap.baseCanvas = { style: {} };
 viewportMap.agentCanvas = { style: {} };
+viewportMap.viewportLayer = { style: {} };
 viewportMap.baseRenderView = viewportMap.viewportInteraction;
-viewportMap.agentRenderView = { centerX: 999, centerY: 999, scale: 99 };
+viewportMap.agentRenderView = { centerX: 4, centerY: 2, scale: 1 };
 viewportMap.viewportAnimationFrame = null;
 let viewportBaseDraws = 0;
 let viewportAgentDraws = 0;
@@ -65,8 +324,9 @@ let viewportWorkerRequests = 0;
 viewportMap.staticRenderReady = true;
 viewportMap.requestStaticRender = () => { viewportWorkerRequests += 1; return true; };
 viewportMap.applyViewportTransform();
-assert.equal(viewportMap.baseCanvas.style.transform, "matrix(2, 0, 0, 2, -70, -40)");
-assert.equal(viewportMap.agentCanvas.style.transform, viewportMap.baseCanvas.style.transform);
+assert.equal(viewportMap.viewportLayer.style.transform, "matrix(2, 0, 0, 2, -70, -40)");
+assert.equal(viewportMap.baseCanvas.style.transform, undefined);
+assert.equal(viewportMap.agentCanvas.style.transform, "matrix(2, 0, 0, 2, -62, -36)");
 
 for (const padding of [160, 320, 512]) {
   for (const ratio of [0.8, 1, 2]) {
@@ -106,6 +366,8 @@ try {
   assert.equal(viewportBaseDraws, 0);
   assert.equal(viewportAgentDraws, 0);
   assert.equal(viewportWorkerRequests, 0);
+  assert.equal(viewportMap.viewportLayer.style.transform, "matrix(2, 0, 0, 2, -70, -40)");
+  assert.equal(viewportMap.agentCanvas.style.transform, "matrix(2, 0, 0, 2, -62, -36)");
 } finally {
   if (originalRequestAnimationFrame === undefined) {
     delete globalThis.requestAnimationFrame;
@@ -147,14 +409,114 @@ assert.equal(workerMap.staticRenderQueued, true);
 
 let bitmapDraws = 0;
 let bitmapCloses = 0;
+let bitmapDrawArgumentCount = 0;
 workerMap.baseCanvas = { width: 175, height: 150, style: {} };
 workerMap.agentCanvas = { style: {} };
+workerMap.viewportLayer = { style: {} };
+workerMap.scheduleViewportDraw = () => {};
 workerMap.baseContext = {
   setTransform() {},
   clearRect() {},
-  drawImage() { bitmapDraws += 1; },
+  drawImage(...args) {
+    bitmapDraws += 1;
+    bitmapDrawArgumentCount = args.length;
+  },
   set globalAlpha(value) {},
 };
+
+let rendererTransfers = 0;
+let rendererBitmapCloses = 0;
+const rendererPresenterMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+rendererPresenterMap.baseBitmapContext = {
+  transferFromImageBitmap() { rendererTransfers += 1; },
+};
+rendererPresenterMap.baseContext = {
+  drawImage() { assert.fail("bitmaprenderer must avoid the 2D copy"); },
+};
+assert.equal(rendererPresenterMap.presentBaseBitmap({
+  close() { rendererBitmapCloses += 1; },
+}), true);
+assert.equal(rendererTransfers, 1);
+assert.equal(rendererBitmapCloses, 0);
+
+let stagedTransfers = 0;
+const stagedBitmap = { close() { assert.fail("successful transfer consumes the bitmap"); } };
+const stagedSurface = {
+  width: 1,
+  height: 1,
+  transferToImageBitmap() { return stagedBitmap; },
+};
+const stagedPresenterMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+Object.assign(stagedPresenterMap, {
+  baseCanvas: { width: 175, height: 150 },
+  baseRenderCanvas: stagedSurface,
+  baseContext: {},
+  baseBitmapContext: {
+    transferFromImageBitmap(bitmap) {
+      assert.equal(bitmap, stagedBitmap);
+      stagedTransfers += 1;
+    },
+  },
+});
+assert.equal(stagedPresenterMap.prepareBaseRenderSurface(), stagedPresenterMap.baseContext);
+assert.equal(stagedSurface.width, 175);
+assert.equal(stagedSurface.height, 150);
+assert.equal(stagedPresenterMap.presentBaseRenderSurface(), true);
+assert.equal(stagedTransfers, 1);
+assert.equal(stagedSurface.width, 1);
+assert.equal(stagedSurface.height, 1);
+
+let replacementDrawArgumentCount = 0;
+let replacementBitmapCloses = 0;
+let installedReplacement = null;
+const replacementContext = {
+  setTransform() {},
+  drawImage(...args) { replacementDrawArgumentCount = args.length; },
+  set globalAlpha(value) {},
+};
+const replacementParent = {
+  replaceChild(replacement, previousCanvas) {
+    assert.equal(previousCanvas, failingPresenterMap.baseCanvas);
+    installedReplacement = replacement;
+    replacement.parentNode = this;
+  },
+};
+const replacementDocument = {
+  createElement(type) {
+    assert.equal(type, "canvas");
+    return {
+      className: "",
+      width: 0,
+      height: 0,
+      style: {},
+      getContext: () => replacementContext,
+      parentNode: null,
+    };
+  },
+};
+const failingPresenterMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+failingPresenterMap.baseCanvas = {
+  ownerDocument: replacementDocument,
+  parentNode: replacementParent,
+  className: "local-map-canvas local-map-base",
+  width: 175,
+  height: 150,
+  style: { width: "140px", height: "120px", left: "-20px", top: "-20px" },
+};
+failingPresenterMap.baseBitmapContext = {
+  transferFromImageBitmap() { throw new Error("lost bitmap presenter"); },
+};
+failingPresenterMap.baseRenderCanvas = { width: 175, height: 150 };
+failingPresenterMap.baseContext = null;
+assert.equal(failingPresenterMap.presentBaseBitmap({
+  close() { replacementBitmapCloses += 1; },
+}), true);
+assert.equal(installedReplacement, failingPresenterMap.baseCanvas);
+assert.equal(failingPresenterMap.baseBitmapContext, null);
+assert.equal(failingPresenterMap.baseRenderCanvas, null);
+assert.equal(replacementDrawArgumentCount, 3);
+assert.equal(replacementBitmapCloses, 1);
+
 workerMap.agentRenderView = workerMessages[0].view;
 workerMap.viewportInteraction = workerMessages[0].view;
 workerMap.dragState = { viewChanged: true };
@@ -263,7 +625,7 @@ timeoutMap.staticRenderWorker = {
   terminate() { timeoutWorkerTerminations += 1; },
 };
 timeoutMap.finishViewportInteraction = () => { timeoutFallbackCommits += 1; };
-timeoutMap.applyViewportTransform = () => { timeoutPreviewUpdates += 1; };
+timeoutMap.scheduleViewportDraw = () => { timeoutPreviewUpdates += 1; };
 timeoutMap.drawBase = () => assert.fail("interactive timeout must use the commit fallback");
 const originalSetTimeout = globalThis.setTimeout;
 const originalClearTimeout = globalThis.clearTimeout;
@@ -349,6 +711,7 @@ Object.assign(fallbackMap, {
   agentRenderView: fallbackView,
   baseCanvas: { style: {} },
   agentCanvas: { style: {} },
+  viewportLayer: { style: {} },
   container: { classList: { add() {}, remove() {} } },
   agents: [],
   previousAgents: new Map(),
@@ -367,6 +730,7 @@ fallbackMap.drawAgents = () => {
   fallbackAgentDraws += 1;
   fallbackMap.agentRenderView = fallbackMap.staticViewSnapshot();
 };
+fallbackMap.scheduleViewportDraw = () => {};
 fallbackMap.fallbackFromStaticRendererFailure();
 assert.equal(fallbackBaseDraws, 0);
 assert.equal(fallbackAgentDraws, 0);
@@ -376,8 +740,9 @@ fallbackMap.finishViewportInteraction();
 assert.equal(fallbackBaseDraws, 1);
 assert.equal(fallbackAgentDraws, 1);
 assert.equal(fallbackMap.viewportInteraction, null);
-assert.equal(fallbackMap.baseCanvas.style.transform, "none");
-assert.equal(fallbackMap.agentCanvas.style.transform, "none");
+assert.equal(fallbackMap.viewportLayer.style.transform, "matrix(1, 0, 0, 1, 0, 0)");
+assert.equal(fallbackMap.baseCanvas.style.transform, undefined);
+assert.equal(fallbackMap.agentCanvas.style.transform, "matrix(1, 0, 0, 1, 0, 0)");
 
 const gestureMap = Object.create(localMapModule.LocalTrafficMap.prototype);
 const gestureTarget = {
@@ -395,16 +760,29 @@ gestureMap.previousAgents = new Map([[gestureTarget.id, {
   lng: 19,
 }]]);
 gestureMap.agentAnimationActive = true;
-gestureMap.animationFrame = null;
+gestureMap.animationFrame = 17;
 gestureMap.viewportCommitTimer = null;
 gestureMap.viewportInteraction = null;
 gestureMap.centerX = 10;
 gestureMap.centerY = 20;
 gestureMap.scale = 3;
 gestureMap.container = { classList: { add() {}, remove() {} } };
+gestureMap.viewportLayer = { style: {} };
+const viewportInteractionChanges = [];
+gestureMap.onViewportInteractionChange = (interacting) => {
+  viewportInteractionChanges.push(interacting);
+};
 gestureMap.beginViewportInteraction();
 assert.equal(gestureMap.agents[0], gestureTarget);
 assert.equal(gestureMap.agents[0].lat, 47.001);
+assert.equal(gestureMap.agentAnimationActive, true);
+assert.equal(gestureMap.animationFrame, 17);
+assert.deepEqual(viewportInteractionChanges, [true]);
+assert.equal(gestureMap.isViewportInteracting(), true);
+gestureMap.completeViewportInteraction();
+assert.deepEqual(viewportInteractionChanges, [true, false]);
+assert.equal(gestureMap.isViewportInteracting(), false);
+assert.equal(gestureMap.viewportLayer.style.transform, "matrix(1, 0, 0, 1, 0, 0)");
 
 const commitMap = Object.create(localMapModule.LocalTrafficMap.prototype);
 Object.assign(commitMap, {
@@ -423,7 +801,9 @@ Object.assign(commitMap, {
   dragState: null,
   animationFrame: null,
   agents: [],
-  previousAgents: new Map(),
+  previousAgents: new Map([[1, { id: 1 }]]),
+  agentAnimationActive: true,
+  transitionStarted: 123,
   selectedRouteIndex: 2,
   previousSelectedRouteIndex: 1,
   interpolationResetAgentIds: new Set(),
@@ -453,6 +833,7 @@ Object.assign(commitMap, {
 commitMap.agentRenderView = commitMap.baseRenderView;
 commitMap.baseCanvas = { width: 175, height: 150, style: {} };
 commitMap.agentCanvas = { style: {} };
+commitMap.viewportLayer = { style: {} };
 commitMap.baseContext = workerMap.baseContext;
 commitMap.container = { classList: { add() {}, remove() {} } };
 const commitMessages = [];
@@ -482,14 +863,20 @@ commitMap.handleStaticRendererMessage({
   },
 });
 assert.equal(commitMap.viewportInteraction, null);
-assert.equal(commitMap.baseCanvas.style.transform, "none");
-assert.equal(commitMap.agentCanvas.style.transform, "none");
+assert.equal(commitMap.viewportLayer.style.transform, "matrix(1, 0, 0, 1, 0, 0)");
+assert.equal(commitMap.baseCanvas.style.transform, undefined);
+assert.equal(commitMap.agentCanvas.style.transform, "matrix(1, 0, 0, 1, 0, 0)");
 assert.equal(commitAgentDraws, 1);
-assert.equal(commitMap.previousSelectedRouteIndex, 2);
+assert.equal(commitMap.previousSelectedRouteIndex, 1);
+assert.equal(commitMap.previousAgents.size, 1);
+assert.equal(commitMap.agentAnimationActive, true);
+assert.equal(commitMap.transitionStarted, 123);
 assert.equal(commitBaseDraws, 0);
 assert.equal(bitmapDraws, bitmapDrawsBeforeCommit + 1);
+assert.equal(bitmapDrawArgumentCount, 3);
 
 const wheelMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+let wheelRectReads = 0;
 Object.assign(wheelMap, {
   viewportCommitTimer: null,
   viewportInteraction: null,
@@ -505,7 +892,10 @@ Object.assign(wheelMap, {
   containerLeft: 0,
   containerTop: 0,
   container: {
-    getBoundingClientRect: () => ({ left: 100, top: 50 }),
+    getBoundingClientRect: () => {
+      wheelRectReads += 1;
+      return { left: 100, top: 50 };
+    },
     classList: { add() {}, remove() {} },
   },
 });
@@ -515,7 +905,11 @@ wheelMap.screenToWorld = (x, y) => {
   return { x: 10, y: 20 };
 };
 wheelMap.scheduleViewportDraw = () => {};
-wheelMap.scheduleViewportCommit = () => {};
+let wheelCommitSchedules = 0;
+wheelMap.scheduleViewportCommit = () => {
+  wheelCommitSchedules += 1;
+  wheelMap.viewportCommitTimer = 1;
+};
 wheelMap.handleWheel({
   preventDefault() {},
   clientX: 150,
@@ -525,6 +919,96 @@ wheelMap.handleWheel({
 assert.deepEqual(wheelAnchor, { x: 50, y: 40 });
 assert.equal(wheelMap.containerLeft, 100);
 assert.equal(wheelMap.containerTop, 50);
+wheelMap.handleWheel({
+  preventDefault() {},
+  clientX: 160,
+  clientY: 100,
+  deltaY: 0,
+});
+assert.equal(wheelRectReads, 1);
+assert.equal(wheelCommitSchedules, 2);
+wheelMap.dragState = { viewChanged: true };
+wheelMap.handleWheel({
+  preventDefault() {},
+  clientX: 160,
+  clientY: 100,
+  deltaY: 0,
+});
+assert.equal(wheelCommitSchedules, 2);
+
+const nativeWheelPerformanceDescriptor = Object.getOwnPropertyDescriptor(
+  globalThis,
+  "performance",
+);
+const nativeWheelSetTimeout = globalThis.setTimeout;
+let wheelTimerNow = 0;
+let wheelTimerCallback = null;
+const wheelTimerDelays = [];
+try {
+  Object.defineProperty(globalThis, "performance", {
+    configurable: true,
+    value: { now: () => wheelTimerNow },
+  });
+  globalThis.setTimeout = (callback, delay) => {
+    wheelTimerCallback = callback;
+    wheelTimerDelays.push(delay);
+    return { type: "wheel-idle" };
+  };
+  const wheelTimerMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+  Object.assign(wheelTimerMap, {
+    viewportCommitTimer: null,
+    viewportCommitDeadline: null,
+    viewportInteraction: { centerX: 0, centerY: 0, scale: 1 },
+  });
+  let wheelIdleCommits = 0;
+  wheelTimerMap.finishViewportInteraction = () => { wheelIdleCommits += 1; };
+  wheelTimerMap.scheduleViewportCommit();
+  wheelTimerNow = 50;
+  wheelTimerMap.scheduleViewportCommit();
+  assert.equal(wheelTimerDelays.length, 1);
+  wheelTimerNow = 180;
+  wheelTimerCallback();
+  assert.equal(wheelIdleCommits, 0);
+  assert.equal(wheelTimerDelays.length, 2);
+  assert.equal(Math.round(wheelTimerDelays[1]), 50);
+  wheelTimerNow = 230;
+  wheelTimerCallback();
+  assert.equal(wheelIdleCommits, 1);
+} finally {
+  globalThis.setTimeout = nativeWheelSetTimeout;
+  Object.defineProperty(globalThis, "performance", nativeWheelPerformanceDescriptor);
+}
+
+const deferredResolutionMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+let deferredResolutionWrites = 0;
+const deferredAgentCanvas = {
+  _width: 300,
+  _height: 200,
+  style: {},
+  get width() { return this._width; },
+  set width(value) { this._width = value; deferredResolutionWrites += 1; },
+  get height() { return this._height; },
+  set height(value) { this._height = value; deferredResolutionWrites += 1; },
+};
+Object.assign(deferredResolutionMap, {
+  agents: new Array(3_000),
+  agentColorModes: { car: "individual", pedestrian: "uniform" },
+  agentPixelRatio: 1.5,
+  pixelRatio: 1.5,
+  devicePixelRatio: 1.5,
+  width: 200,
+  height: 100,
+  agentCanvas: deferredAgentCanvas,
+  viewportInteraction: { centerX: 0, centerY: 0, scale: 1 },
+  pendingAgentResolutionSync: false,
+});
+assert.equal(deferredResolutionMap.syncAgentCanvasResolution(), false);
+assert.equal(deferredResolutionWrites, 0);
+assert.equal(deferredResolutionMap.pendingAgentResolutionSync, true);
+deferredResolutionMap.viewportInteraction = null;
+assert.equal(deferredResolutionMap.syncAgentCanvasResolution(), true);
+assert.equal(deferredResolutionMap.agentPixelRatio, 1);
+assert.equal(deferredResolutionWrites, 2);
 
 const schedulerMap = Object.create(localMapModule.LocalTrafficMap.prototype);
 Object.assign(schedulerMap, {
@@ -557,17 +1041,46 @@ try {
     queuedAgentFrame = null;
     callback(frame * (1_000 / 60));
   }
-  assert.equal(scheduledAgentDraws.length, 7);
+  assert.equal(scheduledAgentDraws.length, 12);
   for (let index = 1; index < scheduledAgentDraws.length - 1; index += 1) {
-    assert.ok(scheduledAgentDraws[index] - scheduledAgentDraws[index - 1] <= 34);
+    assert.ok(scheduledAgentDraws[index] - scheduledAgentDraws[index - 1] <= 17);
   }
   assert.ok(scheduledAgentDraws.at(-1) >= 176);
   assert.equal(schedulerMap.agentAnimationActive, false);
   assert.equal(schedulerMap.animationFrame, null);
 
+  scheduledAgentDraws.length = 0;
+  schedulerMap.agentAnimationActive = true;
+  schedulerMap.transitionStarted = 0;
+  schedulerMap.lastAgentDrawAt = Number.NEGATIVE_INFINITY;
+  schedulerMap.agentDrawDurationMs = 12;
+  schedulerMap.scheduleAgentDraw();
+  for (let frame = 0; frame < 20 && queuedAgentFrame; frame += 1) {
+    const callback = queuedAgentFrame;
+    queuedAgentFrame = null;
+    callback(frame * (1_000 / 60));
+  }
+  assert.equal(scheduledAgentDraws.length, 7);
+  assert.ok(scheduledAgentDraws.at(-1) >= 176);
+  assert.equal(schedulerMap.agentAnimationActive, false);
+
+  scheduledAgentDraws.length = 0;
+  schedulerMap.agentAnimationActive = true;
+  schedulerMap.transitionStarted = 0;
+  schedulerMap.lastAgentDrawAt = Number.NEGATIVE_INFINITY;
   schedulerMap.viewportInteraction = { centerX: 0, centerY: 0, scale: 1 };
   schedulerMap.scheduleAgentDraw();
-  assert.equal(queuedAgentFrame, null);
+  assert.equal(typeof queuedAgentFrame, "function");
+  const viewportAnimationCallback = queuedAgentFrame;
+  queuedAgentFrame = null;
+  viewportAnimationCallback(0);
+  assert.deepEqual(scheduledAgentDraws, [0]);
+  assert.equal(typeof queuedAgentFrame, "function");
+  schedulerMap.agentDrawDurationMs = 0;
+  const sameTimestampCallback = queuedAgentFrame;
+  queuedAgentFrame = null;
+  sameTimestampCallback(0);
+  assert.deepEqual(scheduledAgentDraws, [0]);
 } finally {
   if (schedulerRequestAnimationFrame === undefined) {
     delete globalThis.requestAnimationFrame;
@@ -575,6 +1088,51 @@ try {
     globalThis.requestAnimationFrame = schedulerRequestAnimationFrame;
   }
 }
+
+const hitMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+const hitAgent = { id: 91, mode: "car" };
+Object.assign(hitMap, {
+  viewportInteraction: { centerX: 0, centerY: 0, scale: 1 },
+  baseRenderView: { centerX: 0, centerY: 0, scale: 1 },
+  centerX: 20,
+  centerY: 0,
+  scale: 4,
+  zoom: 1,
+  width: 100,
+  height: 80,
+  renderedAgents: [{ agent: hitAgent, screen: { x: 50, y: 40 } }],
+  renderedPois: [],
+});
+let hitFeature = null;
+hitMap.onFeatureSelect = (feature) => { hitFeature = feature; };
+hitMap.inspectAt(50, 40);
+assert.equal(hitFeature?.type, "agent");
+assert.equal(hitFeature?.agent, hitAgent);
+
+const poiRebaseMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+Object.assign(poiRebaseMap, {
+  activePoiCategories: new Set(),
+  poiVisibilityCache: {},
+  staticRenderRevision: 0,
+  staticRenderReady: false,
+  viewportInteraction: { centerX: 0, centerY: 0, scale: 1 },
+  viewportCommitTimer: null,
+  viewportCommitDeadline: null,
+  viewportAnimationFrame: null,
+  viewportLayer: { style: {} },
+  agentCanvas: { style: {} },
+});
+poiRebaseMap.viewportGestureActive = () => false;
+let poiRebaseBaseDraws = 0;
+let poiRebaseAgentDraws = 0;
+poiRebaseMap.drawBase = () => { poiRebaseBaseDraws += 1; };
+poiRebaseMap.drawAgents = () => { poiRebaseAgentDraws += 1; };
+poiRebaseMap.setPoiCategories(["parking"]);
+assert.deepEqual([...poiRebaseMap.activePoiCategories], ["parking"]);
+assert.equal(poiRebaseMap.viewportInteraction, null);
+assert.equal(poiRebaseBaseDraws, 1);
+assert.equal(poiRebaseAgentDraws, 1);
+assert.equal(poiRebaseMap.agentCanvas.style.transform, "matrix(1, 0, 0, 1, 0, 0)");
 
 const map = Object.create(localMapModule.LocalTrafficMap.prototype);
 const previous = {
@@ -615,6 +1173,56 @@ const nextStart = map.interpolatedAgentScreen(next, 0);
 assert.equal(nextStart.x, captured.get(1).lng);
 assert.equal(nextStart.y, captured.get(1).lat);
 assert.equal(nextStart.heading, captured.get(1).heading);
+
+const curveMetersPerLongitudeDegree = 111_320 * Math.cos(47 * Math.PI / 180);
+const curvePrevious = {
+  id: 9,
+  mode: "car",
+  lat: 47,
+  lng: 19,
+  heading: 90,
+  waiting: false,
+};
+const curveCurrent = {
+  ...curvePrevious,
+  lat: curvePrevious.lat + 10 / 111_320,
+  lng: curvePrevious.lng + 10 / curveMetersPerLongitudeDegree,
+  heading: 0,
+};
+const curveMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+Object.assign(curveMap, {
+  agents: [curveCurrent],
+  previousAgents: new Map([[curvePrevious.id, curvePrevious]]),
+  interpolationResetAgentIds: new Set(),
+  transitionStarted: 0,
+  agentTransitionDurationMs: 100,
+  agentCurveInterpolationActive: true,
+  metersPerLongitudeDegree: curveMetersPerLongitudeDegree,
+});
+const curveCaptured = curveMap.captureInterpolatedAgents(50).get(curveCurrent.id);
+const curveLinearLatitude = (curvePrevious.lat + curveCurrent.lat) / 2;
+const curveLinearLongitude = (curvePrevious.lng + curveCurrent.lng) / 2;
+assert.ok(curveCaptured.lat < curveLinearLatitude);
+assert.ok(curveCaptured.lng > curveLinearLongitude);
+assert.ok(Math.abs(curveCaptured.heading - 45) < 1e-6);
+
+curveMap.previousAgents = new Map([[
+  curvePrevious.id,
+  { ...curvePrevious, waiting: true },
+]]);
+curveMap.agents = [{ ...curveCurrent, waiting: true }];
+const queuedPose = curveMap.captureInterpolatedAgents(50).get(curveCurrent.id);
+assert.ok(Math.abs(queuedPose.lat - curveLinearLatitude) < 1e-12);
+assert.ok(Math.abs(queuedPose.lng - curveLinearLongitude) < 1e-12);
+assert.equal(queuedPose.heading, 45);
+
+curveMap.previousAgents = new Map([[curvePrevious.id, curvePrevious]]);
+curveMap.agents = [{ ...curveCurrent, relocated: true }];
+curveMap.interpolationResetAgentIds = new Set([String(curveCurrent.id)]);
+const relocatedPose = curveMap.captureInterpolatedAgents(50).get(curveCurrent.id);
+assert.equal(relocatedPose.lat, curveCurrent.lat);
+assert.equal(relocatedPose.lng, curveCurrent.lng);
+assert.equal(relocatedPose.heading, curveCurrent.heading);
 
 const renderMap = Object.create(localMapModule.LocalTrafficMap.prototype);
 renderMap.agentContext = {
@@ -659,12 +1267,15 @@ lifecycleMap.agentFrameIntervalMs = 160;
 lifecycleMap.agentTransitionDurationMs = 176;
 lifecycleMap.agentAnimationActive = true;
 lifecycleMap.animationFrame = null;
+lifecycleMap.syncAgentCanvasResolution = () => false;
 let scheduledDraws = 0;
 lifecycleMap.scheduleAgentDraw = () => { scheduledDraws += 1; };
 lifecycleMap.setAgents([current], { animate: false, resetTiming: true });
 assert.equal(lifecycleMap.previousAgents.size, 0);
 assert.equal(lifecycleMap.lastAgentSnapshotAt, null);
 assert.equal(lifecycleMap.agentFrameIntervalMs, 125);
+assert.equal(lifecycleMap.agentTransitionDurationMs, 125);
+assert.equal(lifecycleMap.agentCurveInterpolationActive, false);
 assert.equal(lifecycleMap.agentAnimationActive, false);
 assert.equal(scheduledDraws, 1);
 
@@ -674,6 +1285,35 @@ lifecycleMap.agentAnimationActive = false;
 lifecycleMap.setAgents([{ ...current }], { animate: true, observeInterval: false });
 assert.equal(lifecycleMap.agentAnimationActive, false);
 assert.equal(scheduledDraws, 1);
+
+const interactingAgentMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+Object.assign(interactingAgentMap, {
+  agents: [previous],
+  previousAgents: new Map([[previous.id, previous]]),
+  interpolationResetAgentIds: new Set(),
+  viewportInteraction: { centerX: 0, centerY: 0, scale: 1 },
+  lastAgentSnapshotAt: 100,
+  agentFrameIntervalMs: 160,
+  agentTransitionDurationMs: 176,
+  agentAnimationActive: true,
+  transitionStarted: 0,
+});
+interactingAgentMap.syncAgentCanvasResolution = () => false;
+let interactionCaptures = 0;
+interactingAgentMap.captureInterpolatedAgents = () => {
+  interactionCaptures += 1;
+  return new Map([[previous.id, previous]]);
+};
+interactingAgentMap.animationFrame = null;
+let interactionDrawSchedules = 0;
+interactingAgentMap.scheduleAgentDraw = () => { interactionDrawSchedules += 1; };
+interactingAgentMap.setAgents([current], { animate: true, observeInterval: true });
+assert.equal(interactionCaptures, 1);
+assert.equal(interactingAgentMap.agents[0], current);
+assert.equal(interactingAgentMap.previousAgents.size, 1);
+assert.equal(interactingAgentMap.agentAnimationActive, true);
+assert.equal(interactingAgentMap.agentCurveInterpolationActive, true);
+assert.equal(interactionDrawSchedules, 1);
 
 const replayMap = Object.create(localMapModule.LocalTrafficMap.prototype);
 replayMap.agents = [previous];
@@ -685,6 +1325,7 @@ replayMap.agentFrameIntervalMs = 160;
 replayMap.agentTransitionDurationMs = 176;
 replayMap.agentAnimationActive = false;
 replayMap.animationFrame = null;
+replayMap.syncAgentCanvasResolution = () => false;
 replayMap.scheduleAgentDraw = () => {};
 const nativePerformanceDescriptor = Object.getOwnPropertyDescriptor(
   globalThis,
@@ -702,12 +1343,14 @@ try {
     transitionDurationMs: 12_000,
   });
   assert.equal(replayMap.agentTransitionDurationMs, 12_000);
+  assert.equal(replayMap.agentCurveInterpolationActive, false);
   replayNow += 6_000;
   const frozenAgents = replayMap.freezeAgentTransition(replayNow);
   assert.equal(frozenAgents[0].lat, 47.0001);
   assert.equal(frozenAgents[0].lng, 19.0001);
   assert.equal(frozenAgents[0].heading, 0);
   assert.equal(replayMap.agentAnimationActive, false);
+  assert.equal(replayMap.agentCurveInterpolationActive, false);
 
   replayMap.setAgents([current], {
     animate: true,
@@ -723,7 +1366,8 @@ try {
   assert.equal(resumedMidpoint.heading, 5);
 
   replayMap.setAgents([next], { animate: true, observeInterval: false });
-  assert.equal(replayMap.agentTransitionDurationMs, 136);
+  assert.equal(replayMap.agentTransitionDurationMs, 160);
+  assert.equal(replayMap.agentCurveInterpolationActive, false);
   assert.ok(replayMap.agentTransitionDurationMs <= 330);
 } finally {
   Object.defineProperty(globalThis, "performance", nativePerformanceDescriptor);
@@ -791,6 +1435,7 @@ assert.equal(selectedDrawCount, 1);
 
 const appearanceMap = Object.create(localMapModule.LocalTrafficMap.prototype);
 appearanceMap.agentColorModes = { car: "uniform", pedestrian: "uniform" };
+appearanceMap.syncAgentCanvasResolution = () => false;
 let appearanceDraws = 0;
 appearanceMap.scheduleAgentDraw = () => { appearanceDraws += 1; };
 assert.equal(appearanceMap.setAgentColorModes({ car: "uniform" }), false);
