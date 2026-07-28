@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from traffic_simulator.console import configure_utf8_stdio  # noqa: E402
+from traffic_simulator.process_runtime import apply_safe_process_runtime  # noqa: E402
 from traffic_simulator.network_simulation import (  # noqa: E402
     NetworkTrafficSimulation,
     RoadNetwork,
@@ -42,6 +43,7 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def main() -> int:
+    apply_safe_process_runtime()
     configure_utf8_stdio()
     arguments = parse_arguments()
     started = time.perf_counter()

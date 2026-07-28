@@ -1551,4 +1551,200 @@ try {
   }
 }
 
+// --- Gesture-path caches ----------------------------------------------------
+// The viewport transform runs these on every animation frame of a pan or zoom,
+// so each one has to stay allocation-light and correctly invalidated.
+
+const poiCacheMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+Object.assign(poiCacheMap, {
+  width: 400,
+  height: 300,
+  zoom: 9,
+  scale: 1,
+  centerX: 0,
+  centerY: 0,
+  // Placed so that each POI lands in its own marker cell and its own label cell
+  // at zoom 9, and all three project inside the 400x300 viewport.
+  pois: [
+    { id: 1, lat: 0.0098, lng: 0.0002, name: "Alfa megálló", category: "transit", weight: 5 },
+    { id: 2, lat: 0.0098, lng: 0.0017967, name: "Béta bolt", category: "shopping", weight: 3 },
+    { id: 3, lat: 0.0085627, lng: 0.0002, name: "Gamma iskola", category: "education", weight: 1 },
+  ],
+  bounds: { south: 0, north: 0.01, west: 0, east: 0.01 },
+  metersPerLongitudeDegree: 111_320,
+  activePoiCategories: new Set(["transit", "shopping", "education"]),
+  poiVisibilityCache: null,
+  poiCategorySignatureMemo: null,
+  poiLabelLayoutCache: null,
+  poiLabelWidths: new Map(),
+});
+poiCacheMap.buildPoiSpatialIndex();
+
+// The category signature must be memoised per set instance, yet still follow a
+// replacement of the set.
+const firstSignature = poiCacheMap.poiCategorySignature();
+assert.equal(poiCacheMap.poiCategorySignature(), firstSignature);
+assert.equal(poiCacheMap.poiCategorySignatureMemo.source, poiCacheMap.activePoiCategories);
+poiCacheMap.activePoiCategories = new Set(["transit"]);
+assert.notEqual(poiCacheMap.poiCategorySignature(), firstSignature);
+poiCacheMap.activePoiCategories = new Set(["transit", "shopping", "education"]);
+assert.equal(poiCacheMap.poiCategorySignature(), firstSignature);
+
+// An unchanged viewport must reuse the very same entry array, which is what the
+// label layout cache keys off.
+const labelLevel = localMapModule.poiLodForZoom(poiCacheMap.zoom);
+const firstEntries = poiCacheMap.visiblePoiEntries(labelLevel, 45);
+assert.equal(poiCacheMap.visiblePoiEntries(labelLevel, 45), firstEntries);
+
+let measureTextCalls = 0;
+const labelContext = {
+  measureText(text) {
+    measureTextCalls += 1;
+    return { width: text.length * 6 };
+  },
+};
+const firstLayout = poiCacheMap.poiLabelLayout(labelLevel, labelContext);
+const measurementsAfterFirstLayout = measureTextCalls;
+assert.ok(measurementsAfterFirstLayout > 0);
+assert.equal(poiCacheMap.poiLabelLayout(labelLevel, labelContext), firstLayout);
+assert.equal(measureTextCalls, measurementsAfterFirstLayout);
+for (const item of firstLayout) {
+  assert.equal(typeof item.label, "string");
+  assert.equal(typeof item.textWidth, "number");
+  assert.equal(typeof item.world.x, "number");
+}
+// Re-measuring an already seen label is served from the width memo even after
+// the layout itself is invalidated.
+poiCacheMap.poiVisibilityCache = null;
+poiCacheMap.poiLabelLayoutCache = null;
+poiCacheMap.poiLabelLayout(labelLevel, labelContext);
+assert.equal(measureTextCalls, measurementsAfterFirstLayout);
+// Dropping a category has to change the visible set, and therefore the layout.
+poiCacheMap.activePoiCategories = new Set(["transit"]);
+poiCacheMap.poiVisibilityCache = null;
+assert.notEqual(poiCacheMap.poiLabelLayout(labelLevel, labelContext), firstLayout);
+
+// matchesSelectedAgent must agree with the String() comparison it replaced.
+const selectionMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+selectionMap.selectedAgentId = null;
+selectionMap.selectedAgentIdSource = null;
+selectionMap.selectedAgentIdNumber = null;
+for (const candidate of [1, "1", 0, -3, "abc", Number.NaN]) {
+  assert.equal(selectionMap.matchesSelectedAgent(candidate), false);
+}
+for (const selected of ["4211", "0", "-7", "abc", "04211", "NaN"]) {
+  selectionMap.selectedAgentId = selected;
+  for (const candidate of [4211, 0, -7, 42, "4211", "abc", "04211", Number.NaN]) {
+    assert.equal(
+      selectionMap.matchesSelectedAgent(candidate),
+      String(candidate) === selected,
+      `matchesSelectedAgent(${String(candidate)}) with selection ${selected}`,
+    );
+  }
+}
+
+// Panning must reuse the mounted tile slots instead of rebuilding the layer.
+const tileMap = Object.create(localMapModule.LocalTrafficMap.prototype);
+let slotAttachments = 0;
+let slotDetachments = 0;
+const createStubElement = () => {
+  const element = {
+    style: {},
+    childNodes: [],
+    parentNode: null,
+    hidden: false,
+    get children() { return element.childNodes; },
+    get childElementCount() { return element.childNodes.length; },
+    append(...nodes) {
+      for (const node of nodes) {
+        for (const child of node.isFragment ? node.childNodes.splice(0) : [node]) {
+          child.parentNode?.detach(child);
+          child.parentNode = element;
+          element.childNodes.push(child);
+          slotAttachments += 1;
+        }
+      }
+    },
+    detach(child) {
+      const index = element.childNodes.indexOf(child);
+      if (index >= 0) {
+        element.childNodes.splice(index, 1);
+        child.parentNode = null;
+      }
+    },
+    remove() {
+      element.parentNode?.detach(element);
+      slotDetachments += 1;
+    },
+    replaceChildren(...nodes) {
+      for (const child of element.childNodes.splice(0)) {
+        child.parentNode = null;
+        slotDetachments += 1;
+      }
+      element.append(...nodes);
+    },
+  };
+  return element;
+};
+const tileLayer = createStubElement();
+Object.assign(tileMap, {
+  worldWidth: 10_000,
+  worldHeight: 10_000,
+  width: 800,
+  height: 600,
+  scale: 1,
+  centerX: 5_000,
+  centerY: 5_000,
+  staticTileDetailSignature: null,
+  staticTileCache: new Map(),
+  container: {
+    ownerDocument: {
+      createDocumentFragment: () => {
+        const fragment = createStubElement();
+        fragment.isFragment = true;
+        return fragment;
+      },
+    },
+  },
+});
+const tileLevel = { id: "z1", scale: 1, kind: "detail" };
+const mountTilesAt = (centerX) => {
+  tileMap.centerX = centerX;
+  const range = tileMap.staticTileRangeForViewport(tileLevel, { ring: 1 });
+  for (let column = range.firstColumn; column <= range.lastColumn; column += 1) {
+    for (let row = range.firstRow; row <= range.lastRow; row += 1) {
+      const key = tileMap.staticTileKey(tileLevel, column, row);
+      if (!tileMap.staticTileCache.has(key)) {
+        const slot = createStubElement();
+        tileMap.staticTileCache.set(key, {
+          key,
+          job: { column, row },
+          canvas: createStubElement(),
+          slot,
+          bytes: 1,
+        });
+      }
+    }
+  }
+  return tileMap.mountStaticTileRange(tileLayer, tileLevel, range, "staticTileDetailSignature", {});
+};
+const initialMounted = mountTilesAt(5_000);
+assert.ok(initialMounted > 0);
+assert.equal(tileLayer.childElementCount, initialMounted);
+slotAttachments = 0;
+slotDetachments = 0;
+// A one-tile pan keeps every overlapping slot in place.
+mountTilesAt(5_000 + 512);
+assert.ok(
+  slotAttachments + slotDetachments < initialMounted,
+  `incremental mount touched ${slotAttachments + slotDetachments} slots of ${initialMounted}`,
+);
+assert.ok(tileLayer.childNodes.every((slot) => slot.parentNode === tileLayer));
+// Every slot the range still wants must be mounted exactly once.
+const mountedAfterPan = tileLayer.childElementCount;
+slotAttachments = 0;
+slotDetachments = 0;
+assert.equal(mountTilesAt(5_000 + 512), mountedAfterPan);
+assert.equal(slotAttachments + slotDetachments, 0);
+
 console.log("local map continuous interpolation/batched overview contract: OK");

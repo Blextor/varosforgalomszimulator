@@ -95,11 +95,28 @@ function shortestHeadingDelta(startHeading, endHeading) {
   return ((endHeading - startHeading + 540) % 360) - 180;
 }
 
+function writePose(target, lat, lng, heading) {
+  if (!target) {
+    return { lat, lng, heading };
+  }
+  target.lat = lat;
+  target.lng = lng;
+  target.heading = heading;
+  return target;
+}
+
+/**
+ * Interpolate between two geographic poses.
+ *
+ * `target` lets a caller supply a reusable pose object. Rendering thousands of
+ * agents at 60 fps would otherwise allocate one throwaway object per agent per
+ * frame, and the resulting minor GCs are visible as stutter.
+ */
 export function interpolateGeographicPose(
   startPose,
   endPose,
   progress,
-  { curve = false, metersPerLongitudeDegree = null } = {},
+  { curve = false, metersPerLongitudeDegree = null, target = null } = {},
 ) {
   const amount = clamp(Number.isFinite(progress) ? progress : 1, 0, 1);
   const rawStartLatitude = Number(startPose?.lat);
@@ -118,11 +135,12 @@ export function interpolateGeographicPose(
   const endLongitude = Number.isFinite(rawEndLongitude)
     ? rawEndLongitude
     : startLongitude;
-  const linearPose = {
-    lat: startLatitude + (endLatitude - startLatitude) * amount,
-    lng: startLongitude + (endLongitude - startLongitude) * amount,
-    heading: interpolateHeading(startPose?.heading, endPose?.heading, amount),
-  };
+  const linearPose = writePose(
+    target,
+    startLatitude + (endLatitude - startLatitude) * amount,
+    startLongitude + (endLongitude - startLongitude) * amount,
+    interpolateHeading(startPose?.heading, endPose?.heading, amount),
+  );
   const rawStartHeading = Number(startPose?.heading);
   const rawEndHeading = Number(endPose?.heading);
   if (
@@ -242,9 +260,10 @@ export function interpolateGeographicPose(
   const tangentHeading = tangentLength > 1e-9
     ? normalizedHeading(Math.atan2(tangentX, -tangentY) * 180 / Math.PI)
     : linearPose.heading;
-  return {
-    lat: startLatitude - positionY / METERS_PER_LATITUDE_DEGREE,
-    lng: startLongitude + positionX / longitudeScale,
-    heading: tangentHeading,
-  };
+  return writePose(
+    target,
+    startLatitude - positionY / METERS_PER_LATITUDE_DEGREE,
+    startLongitude + positionX / longitudeScale,
+    tangentHeading,
+  );
 }

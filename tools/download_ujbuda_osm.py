@@ -19,6 +19,7 @@ from traffic_simulator.osm_network import (  # noqa: E402
     download_ujbuda_network,
 )
 from traffic_simulator.console import configure_utf8_stdio  # noqa: E402
+from traffic_simulator.process_runtime import apply_safe_process_runtime  # noqa: E402
 
 
 DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "ujbuda_network.json.gz"
@@ -76,6 +77,7 @@ def argument_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    apply_safe_process_runtime()
     configure_utf8_stdio()
     args = argument_parser().parse_args(argv)
     if args.retries < 0:

@@ -23,44 +23,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from traffic_simulator.process_runtime import apply_safe_process_runtime
+
 SAFE_CHILD_ENV = "UJBUDA_SAFE_SERVER_CHILD"
 SAFE_RUNTIME_ENV = "UJBUDA_SAFE_RUNTIME"
 NATIVE_CRASH_EXIT_CODES = frozenset({0xC0000005, 0xC0000409})
-
-
-def _apply_safe_child_runtime() -> None:
-    """Reduce native allocator/CPU variability on the affected Windows host."""
-
-    json.encoder.c_make_encoder = None
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        pointer_size = ctypes.c_size_t
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        kernel32.GetProcessAffinityMask.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(pointer_size),
-            ctypes.POINTER(pointer_size),
-        ]
-        kernel32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, pointer_size]
-        process = kernel32.GetCurrentProcess()
-        process_mask = pointer_size()
-        system_mask = pointer_size()
-        if not kernel32.GetProcessAffinityMask(
-            process, ctypes.byref(process_mask), ctypes.byref(system_mask)
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        first_available_cpu = process_mask.value & -process_mask.value
-        if not first_available_cpu or not kernel32.SetProcessAffinityMask(
-            process, first_available_cpu
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-    except (ImportError, OSError, ValueError) as error:
-        print(f"Warning: process affinity could not be limited ({error}).", file=sys.stderr)
 
 
 def _run_supervised_child() -> None:
@@ -115,7 +82,7 @@ def _run_supervised_child() -> None:
 
 if __name__ == "__main__" and os.environ.get(SAFE_RUNTIME_ENV, "1") != "0":
     if os.environ.get(SAFE_CHILD_ENV) == "1":
-        _apply_safe_child_runtime()
+        apply_safe_process_runtime()
     else:
         _run_supervised_child()
 
@@ -210,6 +177,7 @@ class SimulationRuntime:
         self.render_network_content: bytes | None = None
         self.route_catalog: dict[str, Any] | None = None
         self.loaded_mtime_ns: int | None = None
+        self.loaded_catalog_mtime_ns: int | None = None
         self.simulation: NetworkTrafficSimulation | None = None
         self.configuration: tuple[int, int, int] | None = None
         self.running = False
@@ -230,6 +198,7 @@ class SimulationRuntime:
         self.render_network_content = None
         self.route_catalog = None
         self.loaded_mtime_ns = None
+        self.loaded_catalog_mtime_ns = None
         self.simulation = None
         self.configuration = None
         self.running = False
@@ -253,7 +222,15 @@ class SimulationRuntime:
                 "Futtasd: python tools\\download_ujbuda_osm.py"
             )
             return
-        if self.loaded_mtime_ns == file_stat.st_mtime_ns and self.network is not None:
+        try:
+            catalog_mtime_ns = ROUTE_CATALOG_FILE.stat().st_mtime_ns
+        except OSError:
+            catalog_mtime_ns = None
+        if (
+            self.loaded_mtime_ns == file_stat.st_mtime_ns
+            and self.loaded_catalog_mtime_ns == catalog_mtime_ns
+            and self.network is not None
+        ):
             return
         try:
             with gzip.open(self.network_path, "rt", encoding="utf-8") as network_file:
@@ -280,6 +257,7 @@ class SimulationRuntime:
         self.render_network_content = render_content
         self.network_etag = f'"{hashlib.sha256(render_content).hexdigest()}"'
         self.loaded_mtime_ns = file_stat.st_mtime_ns
+        self.loaded_catalog_mtime_ns = catalog_mtime_ns
         # Az A* útvonalkészletet csak a kliens configure kérésekor építjük fel;
         # különben a szerverindítás és az első oldalbetöltés ugyanazt kétszer
         # számolná ki.
@@ -472,6 +450,11 @@ class SimulationRuntime:
         with self.lock:
             if self.simulation is None:
                 raise RuntimeError(self.network_error or "A szimuláció még nincs konfigurálva.")
+            speed = self.speed_multiplier
+            if "speedMultiplier" in payload:
+                speed = float(payload["speedMultiplier"])
+                if speed not in {1.0, 5.0, 15.0, 30.0, 60.0}:
+                    raise ValueError("Érvénytelen időgyorsítás.")
             stats = self.simulation.stats()
             self.simulation.set_agent_targets(
                 cars=int(payload.get("cars", stats["cars"])),
@@ -484,9 +467,6 @@ class SimulationRuntime:
                 self.simulation.seed,
             )
             if "speedMultiplier" in payload:
-                speed = float(payload["speedMultiplier"])
-                if speed not in {1.0, 5.0, 15.0, 30.0, 60.0}:
-                    raise ValueError("Érvénytelen időgyorsítás.")
                 self.speed_multiplier = speed
             return {"running": self.running, "stats": self.simulation.stats()}
 

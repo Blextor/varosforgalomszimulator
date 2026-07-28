@@ -10,6 +10,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -706,6 +707,51 @@ class ServerErrorHandlingTests(unittest.TestCase):
         cars_only = runtime.update_settings({"cars": 550})
         self.assertEqual(cars_only["stats"], {"cars": 550, "pedestrians": 600})
         self.assertEqual(runtime.speed_multiplier, 30)
+
+        with self.assertRaisesRegex(ValueError, "Érvénytelen időgyorsítás"):
+            runtime.update_settings({"cars": 100, "speedMultiplier": 7})
+        self.assertEqual(
+            runtime.simulation.stats(), {"cars": 550, "pedestrians": 600}
+        )
+        self.assertEqual(runtime.speed_multiplier, 30)
+
+    def test_route_catalog_change_invalidates_the_current_simulation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            network_path = directory / "network.json.gz"
+            catalog_path = directory / "catalog.json.gz"
+            with gzip.open(network_path, "wt", encoding="utf-8") as stream:
+                json.dump({"meta": {"networkId": "test-network"}}, stream)
+            with gzip.open(catalog_path, "wt", encoding="utf-8") as stream:
+                json.dump({"version": 1}, stream)
+
+            with patch("server.ROUTE_CATALOG_FILE", catalog_path), patch(
+                "server.RoadNetwork", return_value=object()
+            ), patch.object(
+                SimulationRuntime, "_build_render_network", return_value=b"render"
+            ):
+                runtime = SimulationRuntime(network_path)
+                try:
+                    self.assertEqual(runtime.route_catalog, {"version": 1})
+                    previous_epoch = runtime.simulation_epoch
+                    previous_catalog_mtime = runtime.loaded_catalog_mtime_ns
+                    self.assertIsNotNone(previous_catalog_mtime)
+                    runtime.simulation = object()
+                    runtime.configuration = (1, 1, 1)
+
+                    with gzip.open(catalog_path, "wt", encoding="utf-8") as stream:
+                        json.dump({"version": 2}, stream)
+                    changed_mtime = int(previous_catalog_mtime) + 2_000_000_000
+                    os.utime(catalog_path, ns=(changed_mtime, changed_mtime))
+
+                    runtime.health()
+
+                    self.assertEqual(runtime.route_catalog, {"version": 2})
+                    self.assertIsNone(runtime.simulation)
+                    self.assertIsNone(runtime.configuration)
+                    self.assertEqual(runtime.simulation_epoch, previous_epoch + 1)
+                finally:
+                    runtime.close()
 
     def test_invalid_cli_ports_are_rejected_without_starting_the_server(self) -> None:
         for port in ("-1", "0", "65536"):

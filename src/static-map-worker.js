@@ -2,6 +2,10 @@ const BACKGROUND_COLOR = "#111b18";
 const OUTSIDE_BACKGROUND_COLOR = "#000000";
 const DETAILED_ROAD_MIN_ZOOM = 2.4;
 const SPATIAL_GRID_CELL_SIZE = 250;
+// Integer cell addressing: a `${column}:${row}` key would allocate and hash a
+// string for every probe of every render, and a single tile pass probes
+// hundreds of cells.
+const GRID_KEY_ROW_STRIDE = 1 << 21;
 
 const MODE_STYLES = [
   { color: "#a7704c", alpha: 0.86, dash: [] },
@@ -27,6 +31,10 @@ let renderContext = null;
 
 function clamp(value, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, value));
+}
+
+function gridCellKey(column, row) {
+  return column * GRID_KEY_ROW_STRIDE + row;
 }
 
 function roadLodFraction(priority, zoom) {
@@ -64,7 +72,7 @@ function buildSpatialIndex(geometry, count) {
     const lastRow = Math.floor(Math.max(startY, endY) / SPATIAL_GRID_CELL_SIZE);
     for (let column = firstColumn; column <= lastColumn; column += 1) {
       for (let row = firstRow; row <= lastRow; row += 1) {
-        const key = `${column}:${row}`;
+        const key = gridCellKey(column, row);
         let cell = grid.get(key);
         if (!cell) {
           cell = { column, row, indices: [] };
@@ -135,7 +143,7 @@ function spatialCandidates(index, view, margin) {
   } else {
     for (let column = firstColumn; column <= lastColumn; column += 1) {
       for (let row = firstRow; row <= lastRow; row += 1) {
-        appendCell(index.grid.get(`${column}:${row}`));
+        appendCell(index.grid.get(gridCellKey(column, row)));
       }
     }
   }

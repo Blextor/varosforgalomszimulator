@@ -151,4 +151,24 @@ const slowPolling = simulatedPollStarts(200, 4);
 assert.deepEqual(slowPolling.starts, [0, 200, 400, 600]);
 assert.equal(slowPolling.maxConcurrent, 1);
 
+// A supplied `target` keeps the agent renderer from allocating one pose object
+// per agent per frame, and must produce exactly the allocating result.
+const poseTarget = { lat: 0, lng: 0, heading: 0 };
+for (const [start, end, progress, options] of [
+  [curveStart, curveEnd, 0.5, { curve: true, metersPerLongitudeDegree }],
+  [curveStart, curveEnd, 0, { curve: true, metersPerLongitudeDegree }],
+  [curveStart, curveEnd, 1, { curve: true, metersPerLongitudeDegree }],
+  [reverseTangentStart, curveEnd, 0.5, { curve: true, metersPerLongitudeDegree }],
+  [curveStart, curveEnd, 0.25, {}],
+  [{ lat: Number.NaN, lng: Number.NaN }, curveEnd, 0.5, { curve: true }],
+]) {
+  const allocated = timing.interpolateGeographicPose(start, end, progress, options);
+  const written = timing.interpolateGeographicPose(start, end, progress, {
+    ...options,
+    target: poseTarget,
+  });
+  assert.equal(written, poseTarget);
+  assert.deepEqual({ ...written }, { ...allocated });
+}
+
 console.log("simulation timing cadence/interpolation contract: OK");

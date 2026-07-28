@@ -265,6 +265,18 @@ export function roadModeForSegment(segment) {
   return segment.highway ? "mixed" : "unknown";
 }
 
+// Grid cells are addressed by a single small integer instead of a
+// `${column}:${row}` template string. Map lookups on integer keys avoid a string
+// allocation and a hash per probe, which matters in the per-frame viewport
+// queries that walk hundreds of cells.
+// The stride stays far above any reachable row index: even the finest 7 m POI
+// cell only spans a few thousand rows across the district.
+const GRID_KEY_ROW_STRIDE = 1 << 21;
+
+function gridCellKey(column, row) {
+  return column * GRID_KEY_ROW_STRIDE + row;
+}
+
 function poiStyle(category) {
   return POI_CATEGORY_STYLE[category] || POI_CATEGORY_STYLE.other;
 }
@@ -279,7 +291,7 @@ export function poiLodForZoom(zoom) {
 }
 
 function poiCellKey(world, cellSize) {
-  return `${Math.floor(world.x / cellSize)}:${Math.floor(world.y / cellSize)}`;
+  return gridCellKey(Math.floor(world.x / cellSize), Math.floor(world.y / cellSize));
 }
 
 function comparePoiEntries(left, right) {
@@ -417,12 +429,16 @@ export class LocalTrafficMap {
     this.poiLodIndices = POI_LOD_LEVELS.map(() => ({ markerCells: new Map(), labelCells: new Map() }));
     this.activePoiCategories = new Set(this.pois.map((poi) => poi.category || "other"));
     this.poiVisibilityCache = null;
+    this.poiCategorySignatureMemo = null;
+    this.poiLabelLayoutCache = null;
+    this.poiLabelWidths = new Map();
     this.renderedPois = [];
     this.renderedAgents = [];
     this.trafficHeatmapEnabled = false;
     this.segmentStatistics = new Map();
     this.heatmapRenderView = null;
     this.agentRenderCache = new Map();
+    this.scratchAgentPose = null;
     this.overviewColorBatches = new Map();
     this.waitingAgentScreens = { car: [], pedestrian: [] };
     this.agentColorModes = normalizeAgentColorModes(agentColorModes);
@@ -430,6 +446,8 @@ export class LocalTrafficMap {
     this.agents = [];
     this.previousAgents = new Map();
     this.selectedAgentId = null;
+    this.selectedAgentIdSource = null;
+    this.selectedAgentIdNumber = null;
     this.selectedRouteMode = null;
     this.selectedRouteToken = null;
     this.selectedRouteIndex = 0;
@@ -485,6 +503,8 @@ export class LocalTrafficMap {
     this.staticTileFullLevels = new Map();
     this.staticTileDetailSignature = null;
     this.staticTileFullSignature = null;
+    this.staticTileQueuedDetailSignature = null;
+    this.staticTileStackingState = null;
     this.destroyed = false;
     this.dragState = null;
     this.zoom = 1;
@@ -748,6 +768,7 @@ export class LocalTrafficMap {
   }
 
   buildSpatialIndex() {
+    this.carSegmentEntries = [];
     const lodRanksByWay = new Map();
     for (const segment of this.segments) {
       const start = this.nodeWorld.get(Number(segment.from));
@@ -765,6 +786,9 @@ export class LocalTrafficMap {
       }
       const entry = {
         segment,
+        // Segment statistics arrive keyed by string id; keeping the key on the
+        // entry avoids re-stringifying every segment on each heatmap redraw.
+        segmentIdKey: String(segment.id),
         start,
         end,
         style,
@@ -781,17 +805,22 @@ export class LocalTrafficMap {
       };
       const entryIndex = this.segmentEntries.length;
       this.segmentEntries.push(entry);
+      if (entry.supportsCars) {
+        this.carSegmentEntries.push(entry);
+      }
       const firstColumn = Math.floor(entry.minimumX / this.gridCellSize);
       const lastColumn = Math.floor(entry.maximumX / this.gridCellSize);
       const firstRow = Math.floor(entry.minimumY / this.gridCellSize);
       const lastRow = Math.floor(entry.maximumY / this.gridCellSize);
       for (let column = firstColumn; column <= lastColumn; column += 1) {
         for (let row = firstRow; row <= lastRow; row += 1) {
-          const key = `${column}:${row}`;
-          if (!this.segmentGrid.has(key)) {
-            this.segmentGrid.set(key, []);
+          const key = gridCellKey(column, row);
+          let cell = this.segmentGrid.get(key);
+          if (!cell) {
+            cell = [];
+            this.segmentGrid.set(key, cell);
           }
-          this.segmentGrid.get(key).push(entryIndex);
+          cell.push(entryIndex);
         }
       }
     }
@@ -1130,6 +1159,7 @@ export class LocalTrafficMap {
     this.staticTileFullLevels?.clear?.();
     this.staticTileDetailSignature = null;
     this.staticTileFullSignature = null;
+    this.staticTileQueuedDetailSignature = null;
     this.staticTilePlanLimited = false;
     if (clearCache) {
       this.clearStaticTileCache();
@@ -1322,6 +1352,7 @@ export class LocalTrafficMap {
     this.staticTilePlanLimited = planLimited;
     this.staticTileQueue = [];
     this.staticTileQueuedKeys.clear();
+    this.staticTileQueuedDetailSignature = null;
     for (const job of jobs) {
       this.queueStaticTileJob(job, { pump: false });
     }
@@ -1365,6 +1396,9 @@ export class LocalTrafficMap {
   }
 
   removeStaticTilePlanKey(key, { releaseCache = false } = {}) {
+    // Dropping a planned key can leave a hole in the current viewport range, so
+    // the next presentation pass has to re-evaluate it.
+    this.staticTileQueuedDetailSignature = null;
     this.staticTilePlanKeys.delete(key);
     this.staticTileCompletedKeys.delete(key);
     this.staticTileQueuedKeys.delete(key);
@@ -1691,6 +1725,7 @@ export class LocalTrafficMap {
       this.releaseStaticTileEntry(entry);
       this.staticTileCompletedKeys.delete(key);
       this.staticTilePlanKeys.delete(key);
+      this.staticTileQueuedDetailSignature = null;
       stalled = 0;
       this.staticTilePlanLimited = true;
     }
@@ -1813,14 +1848,45 @@ export class LocalTrafficMap {
     if (!fragment) {
       return 0;
     }
+    // A pan or zoom shifts the range by a tile or two per frame while most tiles
+    // stay put. replaceChildren() would still detach and reattach every slot,
+    // which makes Chrome discard and rebuild the composited layer behind each
+    // tile canvas. Mounting the difference leaves the stable tiles untouched.
     let mounted = 0;
+    const arrivals = [];
+    const retained = new Set();
     for (const entry of entries) {
-      if (this.configureStaticTileSlot(entry, level)) {
-        fragment.append(entry.slot);
-        mounted += 1;
+      if (!this.configureStaticTileSlot(entry, level)) {
+        continue;
+      }
+      mounted += 1;
+      retained.add(entry.slot);
+      if (entry.slot.parentNode !== layer) {
+        arrivals.push(entry.slot);
       }
     }
-    layer.replaceChildren(fragment);
+    const currentSlots = layer.children;
+    if (!currentSlots || typeof layer.append !== "function") {
+      for (const slot of retained) {
+        fragment.append(slot);
+      }
+      layer.replaceChildren(fragment);
+      layer.hidden = mounted === 0;
+      this[signatureProperty] = signature;
+      return mounted;
+    }
+    for (let index = currentSlots.length - 1; index >= 0; index -= 1) {
+      const slot = currentSlots[index];
+      if (!retained.has(slot)) {
+        slot.remove();
+      }
+    }
+    if (arrivals.length) {
+      for (const slot of arrivals) {
+        fragment.append(slot);
+      }
+      layer.append(fragment);
+    }
     layer.hidden = mounted === 0;
     this[signatureProperty] = signature;
     return mounted;
@@ -1828,6 +1894,20 @@ export class LocalTrafficMap {
 
   queueMissingStaticDetailTiles(level, range) {
     if (!range || !level) {
+      return;
+    }
+    // Every frame of a pan lands here, but the job set is a pure function of the
+    // level, the tile range and the plan generation. Repeating it while none of
+    // those moved only rebuilds the same job list and re-sorts the same queue.
+    const signature = [
+      this.staticTileGeneration,
+      level.id,
+      range.firstColumn,
+      range.lastColumn,
+      range.firstRow,
+      range.lastRow,
+    ].join(":");
+    if (this.staticTileQueuedDetailSignature === signature) {
       return;
     }
     const jobs = this.staticTileJobsForRange(level, range, -20);
@@ -1843,6 +1923,9 @@ export class LocalTrafficMap {
     for (const job of jobs) {
       queued = this.queueStaticTileJob(job, { pump: false }) || queued;
     }
+    // Recorded only after the plan mutations above, which deliberately clear the
+    // memo whenever they drop a planned key.
+    this.staticTileQueuedDetailSignature = signature;
     if (queued) {
       this.notifyStaticPreparation("preparing");
       this.pumpStaticTileQueue();
@@ -1908,15 +1991,23 @@ export class LocalTrafficMap {
       );
     }
 
+    // The stacking order only flips between gesture and settled state. Rewriting
+    // six inline z-indexes on every animation frame of a pan costs style
+    // recalculation for no visual change.
     const tilesOnTop = this.viewportGestureActive();
-    this.viewportLayer.style.zIndex = tilesOnTop ? "1" : "3";
-    this.staticFullMapLayer.style.zIndex = (
-      tilesOnTop && fullTransform?.ratio <= 2.25
-    ) ? "2" : "0";
-    this.staticTileLayer.style.zIndex = tilesOnTop ? "3" : "2";
-    this.heatmapCanvas.style.zIndex = "4";
-    this.poiLabelCanvas.style.zIndex = "5";
-    this.agentCanvas.style.zIndex = "6";
+    const fullMapOnTop = tilesOnTop && fullTransform?.ratio <= 2.25;
+    if (
+      this.staticTileStackingState?.tilesOnTop !== tilesOnTop
+      || this.staticTileStackingState?.fullMapOnTop !== fullMapOnTop
+    ) {
+      this.staticTileStackingState = { tilesOnTop, fullMapOnTop };
+      this.viewportLayer.style.zIndex = tilesOnTop ? "1" : "3";
+      this.staticFullMapLayer.style.zIndex = fullMapOnTop ? "2" : "0";
+      this.staticTileLayer.style.zIndex = tilesOnTop ? "3" : "2";
+      this.heatmapCanvas.style.zIndex = "4";
+      this.poiLabelCanvas.style.zIndex = "5";
+      this.agentCanvas.style.zIndex = "6";
+    }
     return fullMounted + detailMounted > 0;
   }
 
@@ -2203,9 +2294,12 @@ export class LocalTrafficMap {
     }
   }
 
-  visibleSegmentEntries(paddingPixels = 40) {
+  // `overviewEntries` lets a caller that only cares about a subset skip the
+  // segments it would discard anyway on the zoomed-out path, where the grid
+  // query is bypassed and the whole network is returned.
+  visibleSegmentEntries(paddingPixels = 40, overviewEntries = this.segmentEntries) {
     if (this.zoom <= 3) {
-      return this.segmentEntries;
+      return overviewEntries;
     }
     const first = this.screenToWorld(-paddingPixels, -paddingPixels);
     const last = this.screenToWorld(this.width + paddingPixels, this.height + paddingPixels);
@@ -2226,7 +2320,11 @@ export class LocalTrafficMap {
     const entries = [];
     for (let column = firstColumn; column <= lastColumn; column += 1) {
       for (let row = firstRow; row <= lastRow; row += 1) {
-        for (const index of this.segmentGrid.get(`${column}:${row}`) || []) {
+        const cell = this.segmentGrid.get(gridCellKey(column, row));
+        if (!cell) {
+          continue;
+        }
+        for (const index of cell) {
           if (this.segmentVisibilityMarks[index] === generation) {
             continue;
           }
@@ -2252,8 +2350,7 @@ export class LocalTrafficMap {
     const lastColumn = Math.floor(maximumX / level.cellSize);
     const firstRow = Math.floor(minimumY / level.cellSize);
     const lastRow = Math.floor(maximumY / level.cellSize);
-    const categoryKey = JSON.stringify([...this.activePoiCategories].sort());
-    const cacheKey = `${level.index}:${firstColumn}:${lastColumn}:${firstRow}:${lastRow}:${categoryKey}`;
+    const cacheKey = `${level.index}:${firstColumn}:${lastColumn}:${firstRow}:${lastRow}:${this.poiCategorySignature()}`;
     if (this.poiVisibilityCache?.key === cacheKey) {
       return this.poiVisibilityCache.entries;
     }
@@ -2261,7 +2358,7 @@ export class LocalTrafficMap {
     const entries = [];
     for (let column = firstColumn; column <= lastColumn; column += 1) {
       for (let row = firstRow; row <= lastRow; row += 1) {
-        const candidates = markerCells.get(`${column}:${row}`);
+        const candidates = markerCells.get(gridCellKey(column, row));
         const winner = candidates?.find((entry) => this.activePoiCategories.has(entry.category));
         if (winner) {
           entries.push(winner);
@@ -2271,6 +2368,24 @@ export class LocalTrafficMap {
     entries.sort(comparePoiEntries);
     this.poiVisibilityCache = { key: cacheKey, entries };
     return entries;
+  }
+
+  // The active-category set is replaced wholesale rather than mutated, so a
+  // reference check is enough to keep this signature fresh without re-sorting
+  // and re-serialising the categories on every viewport query.
+  poiCategorySignature() {
+    const categories = this.activePoiCategories;
+    const memo = this.poiCategorySignatureMemo;
+    if (memo && memo.source === categories && memo.size === categories.size) {
+      return memo.signature;
+    }
+    const signature = [...categories].sort().join(" ");
+    this.poiCategorySignatureMemo = {
+      source: categories,
+      size: categories.size,
+      signature,
+    };
+    return signature;
   }
 
   visiblePoiEntriesForView(level, view, extraPaddingPixels = 30) {
@@ -2291,7 +2406,7 @@ export class LocalTrafficMap {
     const entries = [];
     for (let column = firstColumn; column <= lastColumn; column += 1) {
       for (let row = firstRow; row <= lastRow; row += 1) {
-        const candidates = markerCells.get(`${column}:${row}`);
+        const candidates = markerCells.get(gridCellKey(column, row));
         const winner = candidates?.find((entry) => this.activePoiCategories.has(entry.category));
         if (winner) {
           entries.push(winner);
@@ -2377,12 +2492,23 @@ export class LocalTrafficMap {
     const detailed = this.zoom >= DETAILED_ROAD_MIN_ZOOM;
     const laneWidth = clamp(1.35 + Math.sqrt(this.zoom) * 0.55, 2, 5.2);
     const groups = new Map();
-    for (const entry of this.visibleSegmentEntries(55)) {
-      if (!entry.supportsCars || !roadVisibleAtZoom(entry, this.zoom)) {
+    // Below zoom 3 the visible set is the whole district, so the per-segment
+    // work here runs tens of thousands of times per redraw. Statistics are the
+    // cheapest filter and the projection is inlined to avoid two throwaway
+    // point objects per segment.
+    const offsetX = this.width / 2 - this.centerX * this.scale;
+    const offsetY = this.height / 2 - this.centerY * this.scale;
+    for (const entry of this.visibleSegmentEntries(55, this.carSegmentEntries)) {
+      if (!entry.supportsCars) {
         continue;
       }
-      const statistics = this.segmentStatistics.get(String(entry.segment.id));
+      // Recent traffic is far more selective than the level-of-detail test, so
+      // it runs first and spares most segments the LOD maths.
+      const statistics = this.segmentStatistics.get(entry.segmentIdKey);
       if (!statistics || !statistics.hasRecentTraffic) {
+        continue;
+      }
+      if (!roadVisibleAtZoom(entry, this.zoom)) {
         continue;
       }
       const bucket = clamp(Math.round(Number(statistics.loadPercent || 0) / 5) * 5, 0, 100);
@@ -2397,11 +2523,9 @@ export class LocalTrafficMap {
           path: new Path2D(),
         });
       }
-      const start = this.worldToScreen(entry.start);
-      const end = this.worldToScreen(entry.end);
       const path = groups.get(groupKey).path;
-      path.moveTo(start.x, start.y);
-      path.lineTo(end.x, end.y);
+      path.moveTo(entry.start.x * this.scale + offsetX, entry.start.y * this.scale + offsetY);
+      path.lineTo(entry.end.x * this.scale + offsetX, entry.end.y * this.scale + offsetY);
     }
 
     context.save();
@@ -3087,29 +3211,54 @@ export class LocalTrafficMap {
     const radius = clamp(2.4 + Math.log2(this.zoom + 1) * 0.45, 3, 5.2);
     context.save();
     context.font = "600 10px 'Segoe UI', system-ui, sans-serif";
-    for (const entry of this.visiblePoiEntries(level, 45)) {
+    // A pan or zoom repaints the labels on every animation frame. Only the
+    // projection depends on the live view, so the winner lookup, the truncation
+    // and the text measurement are resolved once per visible-entry set.
+    for (const item of this.poiLabelLayout(level, context)) {
+      const screenX = (item.world.x - this.centerX) * this.scale + this.width / 2;
+      const screenY = (item.world.y - this.centerY) * this.scale + this.height / 2;
+      if (
+        screenX < -40 || screenY < -20
+        || screenX > this.width + 40 || screenY > this.height + 20
+      ) {
+        continue;
+      }
+      const labelX = screenX + radius + 5;
+      const labelY = screenY + 3.5;
+      context.fillStyle = "rgba(5, 14, 12, 0.82)";
+      context.fillRect(labelX - 3, labelY - 10, item.textWidth + 6, 14);
+      context.fillStyle = "rgba(237, 248, 243, 0.9)";
+      context.fillText(item.label, labelX, labelY);
+    }
+    context.restore();
+    this.poiLabelCanvas.style.transform = IDENTITY_VIEWPORT_TRANSFORM;
+  }
+
+  poiLabelLayout(level, context) {
+    const entries = this.visiblePoiEntries(level, 45);
+    const cache = this.poiLabelLayoutCache;
+    // visiblePoiEntries returns the very same array while its own cache is
+    // valid, so reference equality is an exact invalidation signal here.
+    if (cache && cache.entries === entries && cache.levelIndex === level.index) {
+      return cache.items;
+    }
+    const widths = this.poiLabelWidths || (this.poiLabelWidths = new Map());
+    const items = [];
+    for (const entry of entries) {
       const name = String(entry.poi.name || "").trim();
       if (!name || !this.isPoiLabelWinner(entry, level)) {
         continue;
       }
-      const screen = this.worldToScreen(entry.world);
-      if (
-        screen.x < -40 || screen.y < -20
-        || screen.x > this.width + 40 || screen.y > this.height + 20
-      ) {
-        continue;
-      }
       const label = name.length > 30 ? `${name.slice(0, 29)}…` : name;
-      const textWidth = context.measureText(label).width;
-      const labelX = screen.x + radius + 5;
-      const labelY = screen.y + 3.5;
-      context.fillStyle = "rgba(5, 14, 12, 0.82)";
-      context.fillRect(labelX - 3, labelY - 10, textWidth + 6, 14);
-      context.fillStyle = "rgba(237, 248, 243, 0.9)";
-      context.fillText(label, labelX, labelY);
+      let textWidth = widths.get(label);
+      if (textWidth === undefined) {
+        textWidth = context.measureText(label).width;
+        widths.set(label, textWidth);
+      }
+      items.push({ world: entry.world, label, textWidth });
     }
-    context.restore();
-    this.poiLabelCanvas.style.transform = IDENTITY_VIEWPORT_TRANSFORM;
+    this.poiLabelLayoutCache = { entries, levelIndex: level.index, items };
+    return items;
   }
 
   drawTurnArrows(context, padding = 0) {
@@ -3625,10 +3774,7 @@ export class LocalTrafficMap {
         entry.agent = agent;
       }
       const screen = this.interpolatedAgentScreen(agent, progress, entry.screen);
-      if (
-        this.selectedAgentId !== null
-        && String(agent.id) === this.selectedAgentId
-      ) {
+      if (this.matchesSelectedAgent(agent.id)) {
         selectedEntry = entry;
       }
       if (
@@ -3670,6 +3816,31 @@ export class LocalTrafficMap {
       : this.agentDrawDurationMs * 0.75 + drawDuration * 0.25;
   }
 
+  // Exactly `String(agentId) === this.selectedAgentId`, but without allocating a
+  // string per agent per frame. The numeric shortcut only applies when the
+  // selected id round-trips through Number(), so both forms always agree.
+  matchesSelectedAgent(agentId) {
+    const selectedAgentId = this.selectedAgentId;
+    if (selectedAgentId === null || selectedAgentId === undefined) {
+      return false;
+    }
+    if (typeof agentId === "number") {
+      if (this.selectedAgentIdSource !== selectedAgentId) {
+        const numeric = Number(selectedAgentId);
+        this.selectedAgentIdSource = selectedAgentId;
+        this.selectedAgentIdNumber = (
+          Number.isFinite(numeric) && String(numeric) === selectedAgentId
+        )
+          ? numeric
+          : null;
+      }
+      if (this.selectedAgentIdNumber !== null) {
+        return agentId === this.selectedAgentIdNumber;
+      }
+    }
+    return String(agentId) === selectedAgentId;
+  }
+
   interpolationStartAgent(agent) {
     const resetInterpolation = this.interpolationResetAgentIds.size > 0
       && this.interpolationResetAgentIds.has(String(agent.id));
@@ -3680,7 +3851,7 @@ export class LocalTrafficMap {
     return !previous || teleported ? agent : previous;
   }
 
-  interpolatedAgentPose(agent, progress, startAgent = null) {
+  interpolatedAgentPose(agent, progress, startAgent = null, poseTarget = null) {
     const start = startAgent || this.interpolationStartAgent(agent);
     const curve = Boolean(
       this.agentCurveInterpolationActive
@@ -3691,11 +3862,17 @@ export class LocalTrafficMap {
     return interpolateGeographicPose(start, agent, progress, {
       curve,
       metersPerLongitudeDegree: this.metersPerLongitudeDegree,
+      target: poseTarget,
     });
   }
 
   interpolatedAgentScreen(agent, progress, target = null) {
-    const pose = this.interpolatedAgentPose(agent, progress);
+    // The pose is consumed immediately below, so a single scratch object can
+    // serve every agent of the frame instead of one allocation each.
+    const scratchPose = target
+      ? (this.scratchAgentPose || (this.scratchAgentPose = { lat: 0, lng: 0, heading: 0 }))
+      : null;
+    const pose = this.interpolatedAgentPose(agent, progress, null, scratchPose);
     const screen = target || this.worldToScreen(this.coordinateToWorld(pose.lat, pose.lng));
     if (target) {
       const worldX = (Number(pose.lng) - this.bounds.west) * this.metersPerLongitudeDegree;
@@ -3708,10 +3885,7 @@ export class LocalTrafficMap {
   }
 
   drawAgent(context, agent, screen, metrics = agentVisualMetrics(this.zoom)) {
-    if (
-      this.selectedAgentId !== null
-      && String(agent.id) === this.selectedAgentId
-    ) {
+    if (this.matchesSelectedAgent(agent.id)) {
       this.drawSelectedAgentHalo(context, screen.x, screen.y, agent.mode);
     }
     const color = agentColorFor(agent, this.agentColorModes);
@@ -3751,10 +3925,7 @@ export class LocalTrafficMap {
     let selected = null;
     let activeColorBatchCount = 0;
     for (const entry of this.renderedAgents) {
-      if (
-        this.selectedAgentId !== null
-        && String(entry.agent.id) === this.selectedAgentId
-      ) {
+      if (this.matchesSelectedAgent(entry.agent.id)) {
         selected = entry;
         continue;
       }

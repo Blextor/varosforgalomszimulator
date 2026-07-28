@@ -285,6 +285,8 @@ csak egyszer építi fel, a rejtett vagy kapcsolatot vesztett böngészőlapok p
 ritkábban kérik le az állapotot. Az `error.log` már a nagy hálózat betöltése előtt
 bekapcsolja a Python `faulthandler` naplózását, ezért egy natív Windows/Python
 összeomlásnál is megmaradhat az utolsó Python stack, PID és életciklus-jelölő.
+A nagy gráfot betöltő parancssori eszközök ugyanazt az egy processzormagos,
+stabil JSON-feldolgozási beállítást használják, mint a felügyelt szerverfolyamat.
 
 ## Adatforrás és licenc
 
